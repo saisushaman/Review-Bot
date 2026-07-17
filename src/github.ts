@@ -148,32 +148,29 @@ export async function ciGreen(owner: string, repo: string, ref: string): Promise
 }
 
 /**
- * True when ANOTHER reviewer is blocking: the PR's reviewDecision is CHANGES_REQUESTED, or there's
- * an unresolved review thread opened by someone other than `me`. The bot must not approve over
- * other reviewers' (human or codex/copilot/gemini/charlie) open feedback — approval clears only its
- * OWN findings. Fails safe: on a query error it returns true (block) so we never approve blindly.
+ * True when ANY review feedback is still open, so the bot must NOT approve: the PR's reviewDecision
+ * is CHANGES_REQUESTED, or ANY review thread is unresolved — the bot's OWN automated-review threads
+ * AND every other reviewer's (human or codex/copilot/gemini/charlie). Approval requires that every
+ * comment is addressed (resolved on GitHub). Fails safe: on a query error it returns true (block)
+ * so we never approve blindly.
  */
-export async function othersBlockApproval(
+export async function hasOpenReviewFeedback(
   owner: string,
   repo: string,
-  number: number,
-  me: string
+  number: number
 ): Promise<boolean> {
   const q = `query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ pullRequest(number:$n){
     reviewDecision
-    reviewThreads(first:100){ nodes { isResolved comments(first:1){ nodes { author { login } } } } }
+    reviewThreads(first:100){ nodes { isResolved } }
   }}}`;
   try {
     const res: any = await octokit.graphql(q, { o: owner, r: repo, n: number });
     const pr = res.repository.pullRequest;
     if (pr.reviewDecision === "CHANGES_REQUESTED") return true;
-    const nodes = pr.reviewThreads.nodes as Array<{
-      isResolved: boolean;
-      comments: { nodes: Array<{ author: { login: string } | null }> };
-    }>;
-    return nodes.some((t) => !t.isResolved && (t.comments.nodes[0]?.author?.login ?? "") !== me);
+    const nodes = pr.reviewThreads.nodes as Array<{ isResolved: boolean }>;
+    return nodes.some((t) => !t.isResolved); // any unresolved comment thread (any author) blocks
   } catch {
-    return true; // fail closed — don't approve if we can't confirm others aren't blocking
+    return true; // fail closed — don't approve if we can't confirm all comments are resolved
   }
 }
 
