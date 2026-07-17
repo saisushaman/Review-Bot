@@ -16,6 +16,15 @@ async function threadReply(client: WebClient, threadTs: string, text: string): P
   await client.chat.postMessage({ channel: config.slack.channelId, thread_ts: threadTs, text });
 }
 
+/** True only when a reply is an intentional "addressed" SIGNAL — it LEADS with the word (after
+ *  stripping @-mentions), e.g. "addressed", "done", "fixed it", "@Sushama addressed". A sentence
+ *  that merely mentions the word ("…verify if all comments are addressed", "copilot feedback has
+ *  not been addressed") is NOT a signal, so the bot doesn't :eyes:/approve on meta-chatter. */
+function isAddressedSignal(text?: string): boolean {
+  const stripped = (text ?? "").replace(/<@[^>]+>/g, " ").trim();
+  return /^(address(ed|ing)?|done|fixed|resolved|updated|ready|pushed|good to go)\b/i.test(stripped);
+}
+
 /** True if any message already in this thread contains `marker` — used to post a note AT MOST ONCE
  *  (maybeApprove runs on every thread reply, so an un-guarded note would repeat each time). */
 async function threadHasNote(client: WebClient, threadTs: string, marker: string): Promise<boolean> {
@@ -125,12 +134,9 @@ export async function maybeApprove(
   // Parent must be a PR the bot reviewed (carries :eyes:).
   if (!(await reactionNames(client, parentTs)).includes(config.claimEmoji)) return;
 
-  // Only an "addressed"-style reply is an approval signal — ignore ordinary thread chatter so the
-  // bot never approves on an unrelated message.
-  const isAddressed = /\b(address(ed)?|done|fixed|resolved|updated|ready|pushed)\b/i.test(
-    replyText ?? ""
-  );
-  if (!isAddressed) return;
+  // Only a reply that LEADS with an "addressed" signal counts — ignore ordinary thread chatter
+  // (incl. messages that merely mention the word) so the bot never :eyes:/approves on discussion.
+  if (!isAddressedSignal(replyText)) return;
 
   // Acknowledge it with :eyes: on the reply itself so it's visible the bot caught the signal (even
   // if it then holds, e.g. CI not green). Idempotent; swallow any error.
@@ -203,7 +209,6 @@ export async function maybeApprove(
  */
 export async function reconcileApprovals(client: WebClient, botUserId: string): Promise<void> {
   const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 30 });
-  const ADDRESSED = /\b(address(ed)?|done|fixed|resolved|updated|ready|pushed)\b/i;
   for (const msg of hist.messages ?? []) {
     const m = msg as { ts?: string; text?: string; reactions?: Array<{ name: string }> };
     if (!m.ts || !m.text) continue;
@@ -220,7 +225,7 @@ export async function reconcileApprovals(client: WebClient, botUserId: string): 
     const replies = (thread.messages ?? []).slice(1).reverse();
     const signal = replies.find((r) => {
       const rm = r as { user?: string; text?: string };
-      return rm.user !== botUserId && ADDRESSED.test(rm.text ?? "");
+      return rm.user !== botUserId && isAddressedSignal(rm.text);
     }) as { user?: string; text?: string; ts?: string } | undefined;
     if (!signal) continue;
     await maybeApprove(client, m.ts, m.text, signal.user ?? "", botUserId, signal.ts, signal.text);
