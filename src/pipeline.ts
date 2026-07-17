@@ -151,9 +151,15 @@ export async function maybeApprove(
   // to be marked resolved. CI pending/failing ⇒ hold silently (no chat noise); re-checks next reply.
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
 
-  // Duplicate guard — never approve when a competing OPEN PR touches the same files.
-  const files = await gh.changedFilePaths(owner, repo, number);
-  const dupes = await gh.openPrsTouchingFiles(owner, repo, number, files);
+  // Duplicate guard — never approve when a competing OPEN PR touches the same SOURCE files. Ignore
+  // incidental shared files (the append-only SOW ledger, docs, markdown, changelogs) — nearly every
+  // PR touches those, so counting them made the guard fire on essentially everything (e.g. #98 held
+  // only because it shares docs/sow/ledger.md with an unrelated docs PR). Only a shared code file
+  // signals a real competing implementation.
+  const codeFile = (f: string) =>
+    !/\.(md|mdx|txt|rst)$/i.test(f) && !/(^|\/)docs\//i.test(f) && !/ledger|changelog/i.test(f);
+  const files = (await gh.changedFilePaths(owner, repo, number)).filter(codeFile);
+  const dupes = files.length ? await gh.openPrsTouchingFiles(owner, repo, number, files) : [];
   if (dupes.length) {
     // Post the "competing PR" note AT MOST ONCE per thread, then hold silently on later replies —
     // maybeApprove runs on every reply, so re-posting it each time spams the thread (user-set
