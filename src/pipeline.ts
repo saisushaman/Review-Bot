@@ -179,5 +179,5 @@ export async function maybeApprove(
     timestamp: parentTs,
     name: config.approvedEmoji,
   });
-  await threadReply(client, parentTs, "✅ Addressed + CI green — approved.");
+  await threadReply(client, parentTs, "✅ Approved — CI green.");
 }
