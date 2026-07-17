@@ -16,6 +16,17 @@ async function threadReply(client: WebClient, threadTs: string, text: string): P
   await client.chat.postMessage({ channel: config.slack.channelId, thread_ts: threadTs, text });
 }
 
+/** True if any message already in this thread contains `marker` — used to post a note AT MOST ONCE
+ *  (maybeApprove runs on every thread reply, so an un-guarded note would repeat each time). */
+async function threadHasNote(client: WebClient, threadTs: string, marker: string): Promise<boolean> {
+  const res = await client.conversations.replies({
+    channel: config.slack.channelId,
+    ts: threadTs,
+    limit: 100,
+  });
+  return (res.messages ?? []).some((m) => ((m as { text?: string }).text ?? "").includes(marker));
+}
+
 /**
  * A new PR-review request landed in the channel. Eligibility = PR URL + tags the
  * required user + no :eyes:. Debounce, claim, review, post, reply. Leaves :eyes:
@@ -127,11 +138,17 @@ export async function maybeApprove(
   const files = await gh.changedFilePaths(owner, repo, number);
   const dupes = await gh.openPrsTouchingFiles(owner, repo, number, files);
   if (dupes.length) {
-    await threadReply(
-      client,
-      parentTs,
-      `Fix looks addressed & CI is green, but holding approval: this competes with #${dupes.join(", #")} (same file(s)). A human should pick one — I don't close/merge PRs.`
-    );
+    // Post the "competing PR" note AT MOST ONCE per thread, then hold silently on later replies —
+    // maybeApprove runs on every reply, so re-posting it each time spams the thread (user-set
+    // 2026-07-17). The marker is a stable substring of the note itself.
+    const MARK = "holding approval: this competes with";
+    if (!(await threadHasNote(client, parentTs, MARK))) {
+      await threadReply(
+        client,
+        parentTs,
+        `Fix looks addressed & CI is green, but ${MARK} #${dupes.join(", #")} (same file(s)). A human should pick one — I don't close/merge PRs.`
+      );
+    }
     return;
   }
 
