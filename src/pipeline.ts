@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
-import { reviewPr, verifyFix, type Severity } from "./review.js";
+import { reviewPr, type Severity } from "./review.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
@@ -125,10 +125,16 @@ export async function maybeApprove(
   // Parent must be a PR the bot reviewed (carries :eyes:).
   if (!(await reactionNames(client, parentTs)).includes(config.claimEmoji)) return;
 
-  // Acknowledge an "addressed"-style reply by reacting :eyes: on the reply itself, so it's visible
-  // the bot picked up the signal even if it then holds silently on verify (user-set 2026-07-17).
-  // reactions.add is idempotent (a duplicate succeeds), so no dedupe needed; swallow any error.
-  if (replyTs && /\b(address(ed)?|done|fixed|resolved|updated|ready|pushed)\b/i.test(replyText ?? "")) {
+  // Only an "addressed"-style reply is an approval signal — ignore ordinary thread chatter so the
+  // bot never approves on an unrelated message.
+  const isAddressed = /\b(address(ed)?|done|fixed|resolved|updated|ready|pushed)\b/i.test(
+    replyText ?? ""
+  );
+  if (!isAddressed) return;
+
+  // Acknowledge it with :eyes: on the reply itself so it's visible the bot caught the signal (even
+  // if it then holds, e.g. CI not green). Idempotent; swallow any error.
+  if (replyTs) {
     await client.reactions
       .add({ channel: config.slack.channelId, timestamp: replyTs, name: config.claimEmoji })
       .catch(() => undefined);
@@ -163,23 +169,15 @@ export async function maybeApprove(
     return;
   }
 
-  // Gate 2: verify the fix actually addresses the bot's findings (reconstructed from its comments).
-  // A clean review (no findings) + green CI is already "done" → approve.
-  const prior = await gh.botReviewComments(owner, repo, number, me);
-  if (prior.length) {
-    const diff = await gh.getPrDiff(owner, repo, number);
-    const ok = await verifyFix(
-      prior.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
-      diff
-    );
-    // Not yet verified-addressed → hold SILENTLY and re-check on the next reply. Do NOT post a
-    // "take another look" nag (user-set 2026-07-17): the verify step false-negatives, and nagging
-    // the author when they've already addressed things is noise. Approve when it passes; stay quiet
-    // otherwise.
-    if (!ok) return;
-  }
-
+  // The author said "addressed" and CI is green → approve on their word (user-set 2026-07-17).
+  // We deliberately DON'T gate on verifyFix here: it false-negatived and blocked legitimately
+  // addressed PRs. Approval is not merge (a human still merges), so an explicit "addressed" signal
+  // + green CI is the right bar.
   await gh.approvePr(owner, repo, number);
-  await client.reactions.add({ channel: config.slack.channelId, timestamp: parentTs, name: config.approvedEmoji });
-  await threadReply(client, parentTs, "✅ Findings addressed & CI green — approved.");
+  await client.reactions.add({
+    channel: config.slack.channelId,
+    timestamp: parentTs,
+    name: config.approvedEmoji,
+  });
+  await threadReply(client, parentTs, "✅ Addressed + CI green — approved.");
 }
