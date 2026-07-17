@@ -19,6 +19,7 @@ export const config = {
   slack: {
     signingSecret: req("SLACK_SIGNING_SECRET"),
     token: req("SLACK_TOKEN"),
+    appToken: opt("SLACK_APP_TOKEN", ""), // xapp-… present → Socket Mode (no public URL / tunnel)
     channelId: req("SLACK_CHANNEL_ID"),
     requireTagUserId: req("REQUIRE_TAG_USER_ID"),
   },
@@ -30,7 +31,9 @@ export const config = {
       .filter(Boolean),
   },
   anthropic: {
-    apiKey: req("ANTHROPIC_API_KEY"),
+    // Unused now — the bot reviews via headless Claude Code (`claude -p`) on your subscription,
+    // not the metered API. Kept optional so an old key in .env doesn't matter either way.
+    apiKey: opt("ANTHROPIC_API_KEY", ""),
     model: opt("ANTHROPIC_MODEL", "claude-opus-4-8"),
   },
   port: Number(opt("PORT", "3000")),

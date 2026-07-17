@@ -6,7 +6,8 @@ const octokit = new Octokit({ auth: config.github.token });
 export interface PrMeta {
   title: string;
   authorLogin: string;
-  state: string;
+  state: string; // "open" | "closed"
+  merged: boolean; // true once the PR has been merged
   headOid: string;
   changedFiles: number;
   additions: number;
@@ -31,6 +32,7 @@ export async function getPr(owner: string, repo: string, number: number): Promis
     title: data.title,
     authorLogin: data.user?.login ?? "",
     state: data.state,
+    merged: data.merged ?? false,
     headOid: data.head.sha,
     changedFiles: data.changed_files,
     additions: data.additions,
@@ -50,7 +52,41 @@ export async function getPrDiff(owner: string, repo: string, number: number): Pr
   return res.data as unknown as string;
 }
 
-/** Post ONE review (event=COMMENT) with all inline comments anchored to `commitId`. */
+/**
+ * Map of file path -> set of RIGHT-side (new-file) line numbers present in the unified diff
+ * (added `+` and context ` ` lines). These are the ONLY lines an inline review comment can anchor
+ * to; commenting on any other line makes GitHub 422 the WHOLE review. The caller uses this to keep
+ * anchorable findings inline and fold the rest into the review body (so nothing is lost).
+ */
+export function anchorableLines(diff: string): Map<string, Set<number>> {
+  const map = new Map<string, Set<number>>();
+  let path: string | null = null;
+  let newLine = 0;
+  for (const raw of diff.split("\n")) {
+    if (raw.startsWith("+++ ")) {
+      const p = raw.slice(4).trim().replace(/^b\//, "");
+      path = p === "/dev/null" ? null : p;
+      if (path && !map.has(path)) map.set(path, new Set());
+    } else if (raw.startsWith("@@")) {
+      const m = raw.match(/\+(\d+)/); // @@ -a,b +c,d @@  → new-file start = c
+      newLine = m ? parseInt(m[1], 10) : 0;
+    } else if (path !== null && raw.startsWith("+") && !raw.startsWith("+++")) {
+      map.get(path)!.add(newLine++); // added line — anchorable
+    } else if (path !== null && raw.startsWith(" ")) {
+      map.get(path)!.add(newLine++); // context line — anchorable
+    } else if (raw.startsWith("-") && !raw.startsWith("---")) {
+      /* removed line — does not advance the new-file counter */
+    }
+  }
+  return map;
+}
+
+/**
+ * Post ONE review (event=COMMENT) with inline comments anchored to `commitId`. Resilient: if
+ * GitHub rejects the call because a comment can't anchor to the diff (422), it retries WITHOUT
+ * inline comments, folding them into the body as a markdown list — so a review is never posted
+ * empty-handed and findings are never silently dropped (PR #31).
+ */
 export async function postReview(
   owner: string,
   repo: string,
@@ -59,16 +95,32 @@ export async function postReview(
   body: string,
   comments: ReviewComment[]
 ): Promise<string> {
-  const { data } = await octokit.pulls.createReview({
-    owner,
-    repo,
-    pull_number: number,
-    commit_id: commitId,
-    event: "COMMENT",
-    body,
-    comments: comments.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: c.body })),
-  });
-  return data.html_url;
+  try {
+    const { data } = await octokit.pulls.createReview({
+      owner,
+      repo,
+      pull_number: number,
+      commit_id: commitId,
+      event: "COMMENT",
+      body,
+      comments: comments.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: c.body })),
+    });
+    return data.html_url;
+  } catch (e) {
+    if (comments.length === 0) throw e; // nothing to fold — a real failure
+    const folded =
+      `${body}\n\n---\n**Inline anchoring failed — findings listed here instead (${comments.length}):**\n` +
+      comments.map((c) => `- \`${c.path}:${c.line}\` — ${c.body}`).join("\n");
+    const { data } = await octokit.pulls.createReview({
+      owner,
+      repo,
+      pull_number: number,
+      commit_id: commitId,
+      event: "COMMENT",
+      body: folded,
+    });
+    return data.html_url;
+  }
 }
 
 export async function approvePr(
@@ -78,6 +130,21 @@ export async function approvePr(
   body = "Findings addressed & verified — approving."
 ): Promise<void> {
   await octokit.pulls.createReview({ owner, repo, pull_number: number, event: "APPROVE", body });
+}
+
+/** Green iff no CI check/status on `ref` is pending or failing. No CI at all = vacuously green. */
+export async function ciGreen(owner: string, repo: string, ref: string): Promise<boolean> {
+  const [checks, status] = await Promise.all([
+    octokit.checks.listForRef({ owner, repo, ref, per_page: 100 }),
+    octokit.repos.getCombinedStatusForRef({ owner, repo, ref }),
+  ]);
+  // Every check-run must be completed AND non-failing (in_progress/queued/failure ⇒ not green).
+  const runsOk = checks.data.check_runs.every(
+    (r) => r.status === "completed" && ["success", "neutral", "skipped"].includes(r.conclusion ?? "")
+  );
+  // Legacy commit statuses: "success" (or none) is green; "pending"/"failure" is not.
+  const statusOk = status.data.total_count === 0 || status.data.state === "success";
+  return runsOk && statusOk;
 }
 
 export async function hasApprovedBy(

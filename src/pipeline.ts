@@ -46,6 +46,15 @@ export async function handleReviewRequest(
   }
 
   const meta = await gh.getPr(owner, repo, number);
+
+  // Already merged/closed before we got to it → nothing to review. Leave :eyes: so it isn't
+  // re-picked, note why in-thread, and stop (no GitHub review on a settled PR).
+  if (meta.merged || meta.state !== "open") {
+    const how = meta.merged ? "already merged" : `already ${meta.state}`;
+    await threadReply(client, ts, `Skipping — PR #${number} is ${how}; nothing to review.`);
+    return;
+  }
+
   const me = await gh.authUserLogin();
   if (config.skipOwnPrs && meta.authorLogin === me) {
     await threadReply(client, ts, "Skipping — the bot doesn't review its owner's PRs.");
@@ -55,14 +64,28 @@ export async function handleReviewRequest(
   const diff = await gh.getPrDiff(owner, repo, number);
   const result = await reviewPr(meta, diff);
 
-  const comments = [...result.findings]
-    .sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity])
-    .map((f) => ({ path: f.path, line: f.line, body: `**[${f.severity}]** ${f.body}` }));
+  // Split findings into those that anchor to a real diff line (posted inline) and those that
+  // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
+  // #31 ended up with a summary claiming findings but zero inline comments — never silently drop.
+  const anchor = gh.anchorableLines(diff);
+  const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
+  const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));
+  const overflow = ordered.filter((f) => !anchor.get(f.path)?.has(f.line));
+  const comments = inline.map((f) => ({
+    path: f.path,
+    line: f.line,
+    body: `**[${f.severity}]** ${f.body}`,
+  }));
 
   const tally = (["High", "Medium", "Low"] as Severity[])
     .map((s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`)
     .join(" · ");
-  const body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
+  let body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
+  if (overflow.length) {
+    body +=
+      `\n\n---\n**Findings that couldn't be anchored to the diff (${overflow.length}):**\n` +
+      overflow.map((f) => `- **[${f.severity}]** \`${f.path}:${f.line}\` — ${f.body}`).join("\n");
+  }
 
   const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
   await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${url}`);
@@ -93,34 +116,42 @@ export async function maybeApprove(
   const me = await gh.authUserLogin();
   if (await gh.hasApprovedBy(owner, repo, number, me)) return; // already approved
 
-  const threads = await gh.botReviewThreadsResolved(owner, repo, number, me);
-  if (!threads.any || !threads.allResolved) return; // findings not (all) resolved yet
+  const meta = await gh.getPr(owner, repo, number);
+  if (meta.state !== "open" || meta.merged) return; // nothing to approve
 
-  // Duplicate guard — never approve a PR when a competing OPEN PR touches the same files.
+  // Gate 1 (team pref): approve on verified-fix + GREEN CI — do NOT wait for GitHub review threads
+  // to be marked resolved. CI pending/failing ⇒ hold silently (no chat noise); re-checks next reply.
+  if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
+
+  // Duplicate guard — never approve when a competing OPEN PR touches the same files.
   const files = await gh.changedFilePaths(owner, repo, number);
   const dupes = await gh.openPrsTouchingFiles(owner, repo, number, files);
   if (dupes.length) {
     await threadReply(
       client,
       parentTs,
-      `Fix looks addressed, but holding approval: this competes with #${dupes.join(", #")} (same file(s)). A human should pick one to close — I don't close/merge PRs.`
+      `Fix looks addressed & CI is green, but holding approval: this competes with #${dupes.join(", #")} (same file(s)). A human should pick one — I don't close/merge PRs.`
     );
     return;
   }
 
-  // Verify the fix actually addresses the findings (reconstructed from the bot's own comments).
+  // Gate 2: verify the fix actually addresses the bot's findings (reconstructed from its comments).
+  // A clean review (no findings) + green CI is already "done" → approve.
   const prior = await gh.botReviewComments(owner, repo, number, me);
-  const diff = await gh.getPrDiff(owner, repo, number);
-  const ok = await verifyFix(
-    prior.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
-    diff
-  );
-  if (!ok) {
-    await threadReply(client, parentTs, "The follow-up doesn't fully verify against the findings — holding approval; please take another look.");
-    return;
+  if (prior.length) {
+    const diff = await gh.getPrDiff(owner, repo, number);
+    const ok = await verifyFix(
+      prior.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
+      diff
+    );
+    // Not yet verified-addressed → hold SILENTLY and re-check on the next reply. Do NOT post a
+    // "take another look" nag (user-set 2026-07-17): the verify step false-negatives, and nagging
+    // the author when they've already addressed things is noise. Approve when it passes; stay quiet
+    // otherwise.
+    if (!ok) return;
   }
 
   await gh.approvePr(owner, repo, number);
   await client.reactions.add({ channel: config.slack.channelId, timestamp: parentTs, name: config.approvedEmoji });
-  await threadReply(client, parentTs, "✅ Findings addressed & verified — approved.");
+  await threadReply(client, parentTs, "✅ Findings addressed & CI green — approved.");
 }

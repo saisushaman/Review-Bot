@@ -3,9 +3,14 @@ const { App } = pkg;
 import { config } from "./config.js";
 import { handleReviewRequest, maybeApprove } from "./pipeline.js";
 
+// Socket Mode when an app-level token (xapp-…) is set: an outbound WebSocket to Slack, so there is
+// NO public Request URL / tunnel to rotate or re-verify (the quick-tunnel URL rotates on every
+// cloudflared restart, which silently breaks HTTP delivery). Falls back to HTTP (signing secret +
+// Events API Request URL) when SLACK_APP_TOKEN is unset, so this change is non-breaking.
 const app = new App({
   token: config.slack.token,
   signingSecret: config.slack.signingSecret,
+  ...(config.slack.appToken ? { socketMode: true, appToken: config.slack.appToken } : {}),
 });
 
 let botUserId = "";
@@ -59,8 +64,13 @@ app.message(async ({ message, client }) => {
 (async () => {
   await app.start(config.port);
   const me = await resolveBotUserId();
+  const mode = config.slack.appToken ? "Socket Mode (no tunnel)" : "HTTP (Events API + tunnel)";
   console.log(
-    `[pr-review-bot] listening on :${config.port}  channel=${config.slack.channelId}  as=${me}  model=${config.anthropic.model}`
+    `[pr-review-bot] listening — ${mode}  channel=${config.slack.channelId}  as=${me}  engine=headless-claude-code`
   );
-  console.log(`[pr-review-bot] point your Slack app Event Subscriptions Request URL at  <public-host>/slack/events`);
+  if (!config.slack.appToken) {
+    console.log(
+      `[pr-review-bot] HTTP mode: point Slack Event Subscriptions Request URL at <public-host>/slack/events — NOTE it rotates on every tunnel restart. Set SLACK_APP_TOKEN=xapp-… to switch to Socket Mode and drop the tunnel for good.`
+    );
+  }
 })();

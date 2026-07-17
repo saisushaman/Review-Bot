@@ -1,8 +1,10 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { spawn } from "node:child_process";
 import { config } from "./config.js";
 import type { PrMeta } from "./github.js";
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey });
+// This bot reviews via HEADLESS CLAUDE CODE (`claude -p`) running on your Claude Code
+// subscription — NOT the metered Anthropic API. No API key / credits needed; the `claude`
+// CLI must be installed and logged in (run `claude setup-token` or `claude` → `/login` once).
 
 export type Severity = "High" | "Medium" | "Low";
 export interface Finding {
@@ -27,105 +29,116 @@ RELIABILITY GUARDRAIL — this is critical:
 - Do NOT emit low-confidence or filler comments. For each finding ask "would this survive a skeptical senior engineer, and can I cite the concrete failure or violation?" Emit it ONLY if yes.
 - Prefer FEWER, high-signal findings. If a suggested fix is uncertain, phrase it as a question. Never invent a line-anchored fix you can't stand behind.
 - Zero findings is a valid, common result — return an empty findings array and say the PR is clean in the summary.
-- Anchor each finding to a real line that EXISTS in the added/changed (RIGHT) side of the diff, using the file's line number at the PR head.
+- Anchor each finding to a real line that EXISTS in the added/changed (RIGHT) side of the diff, using the file's line number at the PR head.`;
 
-Return your result ONLY by calling the report_review tool.`;
+/**
+ * Run headless Claude Code one-shot. The prompt is piped via STDIN (never a shell arg), so
+ * untrusted diff content can never inject into the command line. Returns the assistant's final
+ * text (the `result` field of `--output-format json`).
+ */
+function runClaude(prompt: string, timeoutMs = 180_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("claude", ["-p", "--output-format", "json"], {
+      shell: process.platform === "win32", // resolve claude.cmd on Windows
+    });
+    let out = "";
+    let err = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("claude -p timed out"));
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.stderr.on("data", (d) => (err += d.toString()));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`claude -p exited ${code}: ${err.slice(0, 500)}`));
+      try {
+        const env = JSON.parse(out) as { result?: string; is_error?: boolean };
+        if (env.is_error) return reject(new Error(`claude -p error: ${env.result ?? "unknown"}`));
+        resolve(typeof env.result === "string" ? env.result : out);
+      } catch {
+        resolve(out); // not the JSON envelope — return raw and let the caller parse
+      }
+    });
+    child.stdin.write(prompt);
+    child.stdin.end();
+  });
+}
 
-const TOOL: Anthropic.Tool = {
-  name: "report_review",
-  description: "Report the review: a short overall summary and zero or more high-signal findings.",
-  input_schema: {
-    type: "object",
-    properties: {
-      summary: { type: "string", description: "1-3 sentence overall read + severity tally." },
-      findings: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            path: { type: "string", description: "repo-relative file path from the diff" },
-            line: { type: "integer", description: "line number in the PR head (RIGHT side)" },
-            severity: { type: "string", enum: ["High", "Medium", "Low"] },
-            body: {
-              type: "string",
-              description: "one concrete finding: the defect + a failure scenario or fix. Do NOT prefix severity; the poster adds it.",
-            },
-          },
-          required: ["path", "line", "severity", "body"],
-        },
-      },
-    },
-    required: ["summary", "findings"],
-  },
-};
+/** Extract the first JSON object from model text (tolerate ```json fences / surrounding prose). */
+function extractJson<T>(text: string): T {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const raw = fenced ? fenced[1] : text;
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) throw new Error("no JSON object in claude output");
+  return JSON.parse(raw.slice(start, end + 1)) as T;
+}
 
 export async function reviewPr(pr: PrMeta, diff: string): Promise<ReviewResult> {
-  const clipped = diff.length > config.maxDiffBytes ? diff.slice(0, config.maxDiffBytes) + "\n…[diff truncated]…" : diff;
+  const clipped =
+    diff.length > config.maxDiffBytes
+      ? diff.slice(0, config.maxDiffBytes) + "\n…[diff truncated]…"
+      : diff;
 
-  const msg = await client.messages.create({
-    model: config.anthropic.model,
-    max_tokens: 4096,
-    system: SYSTEM,
-    tools: [TOOL],
-    tool_choice: { type: "tool", name: "report_review" },
-    messages: [
-      {
-        role: "user",
-        content:
-          `PR: ${pr.title}\n` +
-          `Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}\n\n` +
-          "Unified diff:\n```diff\n" +
-          clipped +
-          "\n```",
-      },
-    ],
-  });
+  const prompt = `${SYSTEM}
 
-  const call = msg.content.find(
-    (c): c is Anthropic.ToolUseBlock => c.type === "tool_use" && c.name === "report_review"
-  );
-  if (!call) return { summary: "Review produced no structured output.", findings: [] };
-  const input = call.input as { summary?: string; findings?: Finding[] };
+PR: ${pr.title}
+Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}
+
+Unified diff:
+\`\`\`diff
+${clipped}
+\`\`\`
+
+Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
+{"summary": "1-3 sentence overall read + severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "one concrete finding: the defect + a failure scenario or fix. Do NOT prefix severity."}]}
+Zero findings is valid — return an empty findings array and say the PR is clean in the summary.`;
+
+  const text = await runClaude(prompt);
+  let parsed: { summary?: string; findings?: Finding[] };
+  try {
+    parsed = extractJson<{ summary?: string; findings?: Finding[] }>(text);
+  } catch {
+    return { summary: "Review produced no parseable output.", findings: [] };
+  }
   return {
-    summary: input.summary ?? "",
-    findings: (input.findings ?? []).filter(
-      (f) => f && f.path && Number.isInteger(f.line) && f.severity && f.body
-    ),
+    summary: parsed.summary ?? "",
+    // Coerce `line` before validating: models frequently emit it as a string ("138") or float
+    // (138.0). The old `Number.isInteger(f.line)` check dropped every such finding SILENTLY, so a
+    // review would claim findings in its summary but post zero inline comments (PR #31). Now we
+    // parse it and keep any finding with a real positive integer line + the required fields.
+    findings: (parsed.findings ?? [])
+      .map((f) => ({ ...f, line: Math.trunc(Number((f as { line?: unknown }).line)) }))
+      .filter(
+        (f) => f && f.path && Number.isInteger(f.line) && f.line > 0 && f.severity && f.body
+      ),
   };
 }
 
-/** Lightweight verify: does `fixCommitDiff` plausibly address the earlier findings? */
+/** Lightweight verify: does `fixDiff` plausibly address the earlier findings? */
 export async function verifyFix(findings: Finding[], fixDiff: string): Promise<boolean> {
   if (findings.length === 0) return true;
-  const msg = await client.messages.create({
-    model: config.anthropic.model,
-    max_tokens: 512,
-    system:
-      "You verify whether a follow-up diff actually addresses prior review findings. Answer strictly by calling the tool. Be skeptical: only 'true' if each finding is genuinely handled by the diff, not merely touched.",
-    tools: [
-      {
-        name: "verdict",
-        description: "Report whether the findings are addressed by the diff.",
-        input_schema: {
-          type: "object",
-          properties: { addressed: { type: "boolean" }, note: { type: "string" } },
-          required: ["addressed"],
-        },
-      },
-    ],
-    tool_choice: { type: "tool", name: "verdict" },
-    messages: [
-      {
-        role: "user",
-        content:
-          "Prior findings:\n" +
-          findings.map((f, i) => `${i + 1}. [${f.severity}] ${f.path}:${f.line} — ${f.body}`).join("\n") +
-          "\n\nFollow-up diff:\n```diff\n" +
-          fixDiff.slice(0, config.maxDiffBytes) +
-          "\n```",
-      },
-    ],
-  });
-  const call = msg.content.find((c): c is Anthropic.ToolUseBlock => c.type === "tool_use");
-  return Boolean((call?.input as { addressed?: boolean } | undefined)?.addressed);
+  const prompt = `You verify whether a follow-up diff actually addresses prior review findings. Be skeptical: only "true" if each finding is genuinely handled by the diff, not merely touched.
+
+Prior findings:
+${findings.map((f, i) => `${i + 1}. [${f.severity}] ${f.path}:${f.line} — ${f.body}`).join("\n")}
+
+Follow-up diff:
+\`\`\`diff
+${fixDiff.slice(0, config.maxDiffBytes)}
+\`\`\`
+
+Respond with ONLY JSON — no prose, no fences: {"addressed": true | false, "note": "..."}`;
+
+  try {
+    const text = await runClaude(prompt, 90_000);
+    return Boolean(extractJson<{ addressed?: boolean }>(text).addressed);
+  } catch {
+    return false; // fail closed — don't approve if verification couldn't run
+  }
 }
