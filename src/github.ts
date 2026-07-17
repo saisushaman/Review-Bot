@@ -227,6 +227,28 @@ export async function changedFilePaths(owner: string, repo: string, number: numb
   return data.map((f) => f.filename);
 }
 
+/** ALL inline review comments on the PR (every reviewer: the bot's own automated review + codex/
+ *  copilot/gemini/charlie + humans) — the findings the verify step confirms are addressed in the
+ *  commits before approving. */
+export async function allReviewComments(
+  owner: string,
+  repo: string,
+  number: number
+): Promise<Array<{ path: string; line: number; body: string; author: string }>> {
+  const { data } = await octokit.pulls.listReviewComments({
+    owner,
+    repo,
+    pull_number: number,
+    per_page: 100,
+  });
+  return data.map((c) => ({
+    path: c.path,
+    line: c.line ?? c.original_line ?? 0,
+    body: c.body,
+    author: c.user?.login ?? "",
+  }));
+}
+
 /** The bot's own inline review comments — used to reconstruct prior findings for the verify step. */
 export async function botReviewComments(
   owner: string,

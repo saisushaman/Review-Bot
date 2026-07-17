@@ -126,25 +126,49 @@ Every concern goes in findings[]; the summary never describes a specific issue. 
   };
 }
 
-/** Lightweight verify: does `fixDiff` plausibly address the earlier findings? */
-export async function verifyFix(findings: Finding[], fixDiff: string): Promise<boolean> {
-  if (findings.length === 0) return true;
-  const prompt = `You verify whether a follow-up diff actually addresses prior review findings. Be skeptical: only "true" if each finding is genuinely handled by the diff, not merely touched.
+export interface VerifyResult {
+  allAddressed: boolean;
+  unaddressed: string[]; // human-readable list of findings NOT yet addressed
+}
 
-Prior findings:
-${findings.map((f, i) => `${i + 1}. [${f.severity}] ${f.path}:${f.line} — ${f.body}`).join("\n")}
+/**
+ * Verify the CURRENT PR diff actually addresses each review finding (the bot's own + every other
+ * reviewer's). Per-finding verdict with a strict structured contract so the model can't hide the
+ * answer in prose. Fair, not pedantic: a finding counts as addressed if the diff plausibly resolves
+ * it (a fix/guard, the requested doc/clarification, or the flagged code is gone) — false only when
+ * there is no sign it was handled. Fails CLOSED (allAddressed=false) if verification can't run, so
+ * the bot never approves on an unverified fix.
+ */
+export async function verifyFix(findings: Finding[], prDiff: string): Promise<VerifyResult> {
+  if (findings.length === 0) return { allAddressed: true, unaddressed: [] };
+  const list = findings.map((f, i) => `${i}. ${f.path}:${f.line} — ${f.body}`).join("\n");
+  const prompt = `You are checking whether prior code-review findings were ADDRESSED in the CURRENT state of a pull request. For EACH finding, decide if the diff below resolves it.
 
-Follow-up diff:
+Findings (index. path:line — concern):
+${list}
+
+Current PR diff (final state, includes any fix commits):
 \`\`\`diff
-${fixDiff.slice(0, config.maxDiffBytes)}
+${prDiff.slice(0, config.maxDiffBytes)}
 \`\`\`
 
-Respond with ONLY JSON — no prose, no fences: {"addressed": true | false, "note": "..."}`;
+Judge fairly, not pedantically: mark addressed=true if the diff plausibly resolves the concern — a real fix or guard, the doc/clarification the finding asked for, or the flagged code no longer exists. Mark addressed=false ONLY when there is no sign the concern was handled. A finding about code untouched by the diff and still exhibiting the problem is NOT addressed.
 
+Respond with ONLY a JSON object — no prose, no markdown fences — of exactly this shape, with ONE verdict per finding:
+{"verdicts": [{"i": <finding index int>, "addressed": true|false, "why": "<=12 words"}]}`;
   try {
-    const text = await runClaude(prompt, 90_000);
-    return Boolean(extractJson<{ addressed?: boolean }>(text).addressed);
+    const text = await runClaude(prompt, 150_000);
+    const parsed = extractJson<{ verdicts?: Array<{ i?: number; addressed?: boolean; why?: string }> }>(
+      text
+    );
+    const verdicts = parsed.verdicts ?? [];
+    // Incomplete coverage → treat as not-verified (fail closed).
+    if (verdicts.length < findings.length) return { allAddressed: false, unaddressed: ["(verification incomplete)"] };
+    const unaddressed = verdicts
+      .filter((v) => v.addressed !== true)
+      .map((v) => findings[v.i ?? -1]?.body?.slice(0, 60) ?? `finding ${v.i}`);
+    return { allAddressed: unaddressed.length === 0, unaddressed };
   } catch {
-    return false; // fail closed — don't approve if verification couldn't run
+    return { allAddressed: false, unaddressed: ["(verification failed to run)"] };
   }
 }

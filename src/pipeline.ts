@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
-import { reviewPr, type Severity } from "./review.js";
+import { reviewPr, verifyFix, type Severity } from "./review.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
@@ -186,10 +186,21 @@ export async function maybeApprove(
     return;
   }
 
-  // The author said "addressed" and CI is green → approve on their word (user-set 2026-07-17).
-  // We deliberately DON'T gate on verifyFix here: it false-negatived and blocked legitimately
-  // addressed PRs. Approval is not merge (a human still merges), so an explicit "addressed" signal
-  // + green CI is the right bar.
+  // VERIFY the fixes are actually in the commits before approving (user-set 2026-07-17): "addressed"
+  // must mean the code changed to resolve the findings, not just the word. Check the CURRENT PR diff
+  // against EVERY review comment — the bot's own automated review AND the other reviewers'
+  // (codex/copilot/gemini/charlie/humans). Hold SILENTLY (no nag) if any finding isn't addressed;
+  // the sweep re-checks as the author pushes more fixes.
+  const findings = await gh.allReviewComments(owner, repo, number);
+  if (findings.length) {
+    const diff = await gh.getPrDiff(owner, repo, number);
+    const { allAddressed } = await verifyFix(
+      findings.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
+      diff
+    );
+    if (!allAddressed) return; // not every comment is addressed in the commits yet → hold
+  }
+
   await gh.approvePr(owner, repo, number);
   await client.reactions.add({
     channel: config.slack.channelId,
