@@ -29,7 +29,13 @@ RELIABILITY GUARDRAIL — this is critical:
 - Do NOT emit low-confidence or filler comments. For each finding ask "would this survive a skeptical senior engineer, and can I cite the concrete failure or violation?" Emit it ONLY if yes.
 - Prefer FEWER, high-signal findings. If a suggested fix is uncertain, phrase it as a question. Never invent a line-anchored fix you can't stand behind.
 - Zero findings is a valid, common result — return an empty findings array and say the PR is clean in the summary.
-- Anchor each finding to a real line that EXISTS in the added/changed (RIGHT) side of the diff, using the file's line number at the PR head.`;
+- Anchor each finding to a real line that EXISTS in the added/changed (RIGHT) side of the diff, using the file's line number at the PR head.
+
+OUTPUT CONTRACT — non-negotiable, this is what makes the review usable:
+- EVERY issue/concern/question you raise MUST be a separate object in the "findings" array (with path, line, severity, body). This is the ONLY place findings are read from — text elsewhere is discarded.
+- "summary" is a ONE-SENTENCE overall read ONLY. Do NOT describe specific issues, concerns, or a per-file critique in it. If you catch yourself writing "one concern is…", "the issue is…", "note that…", or a severity breakdown in the summary, STOP — move it into a findings[] object instead.
+- The number of findings you mention anywhere MUST equal findings.length. A summary that references a concern while findings is empty is a BUG and an invalid response.
+- If and only if the PR is genuinely clean, findings=[] and the summary says so plainly.`;
 
 /**
  * Run headless Claude Code one-shot. The prompt is piped via STDIN (never a shell arg), so
@@ -96,8 +102,8 @@ ${clipped}
 \`\`\`
 
 Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
-{"summary": "1-3 sentence overall read + severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "one concrete finding: the defect + a failure scenario or fix. Do NOT prefix severity."}]}
-Zero findings is valid — return an empty findings array and say the PR is clean in the summary.`;
+{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "one concrete finding: the defect + a failure scenario or fix. Do NOT prefix severity."}]}
+Every concern goes in findings[]; the summary never describes a specific issue. Zero findings is valid — return an empty findings array and a summary that plainly says the PR is clean.`;
 
   const text = await runClaude(prompt);
   let parsed: { summary?: string; findings?: Finding[] };
