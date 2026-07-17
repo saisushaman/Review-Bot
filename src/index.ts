@@ -51,7 +51,7 @@ app.message(async ({ message, client }) => {
         limit: 1,
       });
       const parentText = parent.messages?.[0]?.text ?? "";
-      await maybeApprove(client, m.thread_ts!, parentText, m.user ?? "", me);
+      await maybeApprove(client, m.thread_ts!, parentText, m.user ?? "", me, m.ts, m.text);
     } else {
       await handleReviewRequest(client, m.ts, m.text, me);
     }

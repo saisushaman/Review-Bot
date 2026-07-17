@@ -113,7 +113,9 @@ export async function maybeApprove(
   parentTs: string,
   parentText: string,
   replyUserId: string,
-  botUserId: string
+  botUserId: string,
+  replyTs?: string,
+  replyText?: string
 ): Promise<void> {
   if (!config.approveWhenAddressed) return;
   const pr = parsePrUrl(parentText);
@@ -122,6 +124,15 @@ export async function maybeApprove(
 
   // Parent must be a PR the bot reviewed (carries :eyes:).
   if (!(await reactionNames(client, parentTs)).includes(config.claimEmoji)) return;
+
+  // Acknowledge an "addressed"-style reply by reacting :eyes: on the reply itself, so it's visible
+  // the bot picked up the signal even if it then holds silently on verify (user-set 2026-07-17).
+  // reactions.add is idempotent (a duplicate succeeds), so no dedupe needed; swallow any error.
+  if (replyTs && /\b(address(ed)?|done|fixed|resolved|updated|ready|pushed)\b/i.test(replyText ?? "")) {
+    await client.reactions
+      .add({ channel: config.slack.channelId, timestamp: replyTs, name: config.claimEmoji })
+      .catch(() => undefined);
+  }
 
   const { owner, repo, number } = pr;
   const me = await gh.authUserLogin();
