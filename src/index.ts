@@ -1,7 +1,7 @@
 import pkg from "@slack/bolt";
 const { App } = pkg;
 import { config } from "./config.js";
-import { handleReviewRequest, maybeApprove } from "./pipeline.js";
+import { handleReviewRequest, maybeApprove, reconcileApprovals } from "./pipeline.js";
 
 // Socket Mode when an app-level token (xapp-…) is set: an outbound WebSocket to Slack, so there is
 // NO public Request URL / tunnel to rotate or re-verify (the quick-tunnel URL rotates on every
@@ -64,6 +64,16 @@ app.message(async ({ message, client }) => {
 (async () => {
   await app.start(config.port);
   const me = await resolveBotUserId();
+
+  // Self-heal sweep: every 2 min, pick up "addressed" replies the live event handler may have
+  // missed (e.g. posted while the bot was restarting — Socket Mode doesn't replay) and approve.
+  const RECONCILE_MS = 120_000;
+  const sweep = () =>
+    reconcileApprovals(app.client, me).catch((e) =>
+      console.error("[pr-review-bot] reconcile error:", e)
+    );
+  setInterval(sweep, RECONCILE_MS);
+  void sweep(); // run one now on boot to catch anything missed while down
   const mode = config.slack.appToken ? "Socket Mode (no tunnel)" : "HTTP (Events API + tunnel)";
   console.log(
     `[pr-review-bot] listening — ${mode}  channel=${config.slack.channelId}  as=${me}  engine=headless-claude-code`

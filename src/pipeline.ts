@@ -181,3 +181,36 @@ export async function maybeApprove(
   });
   await threadReply(client, parentTs, "✅ Approved — CI green.");
 }
+
+/**
+ * Periodic self-heal: scan recent channel messages for reviewed-but-not-yet-approved PRs
+ * (`:eyes:` and no `:white_check_mark:`) and, if their thread already carries an "addressed"-style
+ * reply from someone other than the bot, run the same approve path. This catches "addressed"
+ * replies that arrived while the bot was down/restarting (Socket Mode does NOT replay missed
+ * events), so approvals aren't silently dropped. Idempotent — maybeApprove re-checks everything.
+ */
+export async function reconcileApprovals(client: WebClient, botUserId: string): Promise<void> {
+  const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 30 });
+  const ADDRESSED = /\b(address(ed)?|done|fixed|resolved|updated|ready|pushed)\b/i;
+  for (const msg of hist.messages ?? []) {
+    const m = msg as { ts?: string; text?: string; reactions?: Array<{ name: string }> };
+    if (!m.ts || !m.text) continue;
+    if (!parsePrUrl(m.text) || !tagsRequiredUser(m.text)) continue;
+    const reacts = (m.reactions ?? []).map((r) => r.name);
+    if (!reacts.includes(config.claimEmoji)) continue; // not reviewed by us
+    if (reacts.includes(config.approvedEmoji)) continue; // already approved
+    const thread = await client.conversations.replies({
+      channel: config.slack.channelId,
+      ts: m.ts,
+      limit: 50,
+    });
+    // newest first: the latest non-bot "addressed" reply is the signal to act on
+    const replies = (thread.messages ?? []).slice(1).reverse();
+    const signal = replies.find((r) => {
+      const rm = r as { user?: string; text?: string };
+      return rm.user !== botUserId && ADDRESSED.test(rm.text ?? "");
+    }) as { user?: string; text?: string; ts?: string } | undefined;
+    if (!signal) continue;
+    await maybeApprove(client, m.ts, m.text, signal.user ?? "", botUserId, signal.ts, signal.text);
+  }
+}
