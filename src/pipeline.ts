@@ -151,6 +151,12 @@ export async function maybeApprove(
   // to be marked resolved. CI pending/failing ⇒ hold silently (no chat noise); re-checks next reply.
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
 
+  // Never approve over ANOTHER reviewer's open feedback: hold silently if the PR is
+  // CHANGES_REQUESTED or has unresolved review threads from someone other than the bot (human or
+  // codex/copilot/gemini/charlie). The bot's approval clears only its OWN findings (user-set
+  // 2026-07-17: it approved #98 while copilot/charlie feedback was still unaddressed).
+  if (await gh.othersBlockApproval(owner, repo, number, me)) return;
+
   // Duplicate guard — never approve when a competing OPEN PR touches the same SOURCE files. Ignore
   // incidental shared files (the append-only SOW ledger, docs, markdown, changelogs) — nearly every
   // PR touches those, so counting them made the guard fire on essentially everything (e.g. #98 held
