@@ -148,29 +148,25 @@ export async function ciGreen(owner: string, repo: string, ref: string): Promise
 }
 
 /**
- * True when ANY review feedback is still open, so the bot must NOT approve: the PR's reviewDecision
- * is CHANGES_REQUESTED, or ANY review thread is unresolved — the bot's OWN automated-review threads
- * AND every other reviewer's (human or codex/copilot/gemini/charlie). Approval requires that every
- * comment is addressed (resolved on GitHub). Fails safe: on a query error it returns true (block)
- * so we never approve blindly.
+ * True when another reviewer is EXPLICITLY blocking — the PR's reviewDecision is CHANGES_REQUESTED
+ * (a human or codex/copilot/gemini/charlie requested changes that haven't been dismissed/re-approved).
+ * We deliberately do NOT require review threads to be marked "resolved": the team addresses comments
+ * without clicking "Resolve conversation", so the author's "addressed" signal + no CHANGES_REQUESTED
+ * is the bar. Fails safe: on a query error it returns true (block).
  */
-export async function hasOpenReviewFeedback(
+export async function changesRequested(
   owner: string,
   repo: string,
   number: number
 ): Promise<boolean> {
   const q = `query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ pullRequest(number:$n){
     reviewDecision
-    reviewThreads(first:100){ nodes { isResolved } }
   }}}`;
   try {
     const res: any = await octokit.graphql(q, { o: owner, r: repo, n: number });
-    const pr = res.repository.pullRequest;
-    if (pr.reviewDecision === "CHANGES_REQUESTED") return true;
-    const nodes = pr.reviewThreads.nodes as Array<{ isResolved: boolean }>;
-    return nodes.some((t) => !t.isResolved); // any unresolved comment thread (any author) blocks
+    return res.repository.pullRequest.reviewDecision === "CHANGES_REQUESTED";
   } catch {
-    return true; // fail closed — don't approve if we can't confirm all comments are resolved
+    return true; // fail closed — don't approve if we can't confirm nothing is blocking
   }
 }
 

@@ -157,11 +157,10 @@ export async function maybeApprove(
   // to be marked resolved. CI pending/failing ⇒ hold silently (no chat noise); re-checks next reply.
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
 
-  // Only approve when EVERY review comment is addressed — resolved on GitHub. Hold silently if the
-  // PR is CHANGES_REQUESTED or ANY review thread is unresolved, whether it's the bot's OWN
-  // automated-review comments or another reviewer's (human / codex / copilot / gemini / charlie).
-  // (user-set 2026-07-17.)
-  if (await gh.hasOpenReviewFeedback(owner, repo, number)) return;
+  // Don't approve over an EXPLICIT block: hold silently if a reviewer marked CHANGES_REQUESTED
+  // (human / codex / copilot / gemini / charlie). We do NOT require threads to be marked "resolved"
+  // — the author's "addressed" signal + no CHANGES_REQUESTED is the bar (user-set 2026-07-17).
+  if (await gh.changesRequested(owner, repo, number)) return;
 
   // Duplicate guard — never approve when a competing OPEN PR touches the same SOURCE files. Ignore
   // incidental shared files (the append-only SOW ledger, docs, markdown, changelogs) — nearly every
