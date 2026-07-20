@@ -4,6 +4,16 @@ A field log of every snag hit taking this bot from "code compiles" to
 "reviews a PR the instant it's posted in Slack," and how each was fixed.
 Read this before wiring up a fresh workspace — it will save an hour.
 
+> **⚠️ Superseded since this was written — read the README first.** The bot now
+> uses **Socket Mode** (set `SLACK_APP_TOKEN=xapp-…` → outbound WebSocket, no public
+> Request URL and no tunnel), and reviews via **headless Claude Code (`claude -p`)**
+> on your subscription — **no Anthropic API key/credits.** So the notes below about
+> the **Anthropic key + billing (#6)**, the **cloudflared tunnel (#8)**, and the
+> **Event-Subscriptions Request URL verification (#10, #11)** only apply to the
+> legacy HTTP fallback. In Socket Mode you skip all of them — just enable Socket
+> Mode, subscribe `message.channels`, and `/invite` the bot (#12 still applies).
+> The rest (scopes, install, port conflicts, "Features" navigation) still holds.
+
 The end-to-end chain that has to be true for a tag to trigger a review:
 
 ```
