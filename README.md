@@ -127,6 +127,30 @@ src/
   index.ts      Slack app (Socket Mode / HTTP) → pipeline, + the 2-min reconcile timer
 ```
 
+## Skill variant (Claude Code) — `skill/`
+
+The same bot as a **Claude Code skill** (driven by `/pr-review-bot` + `/loop`, or a
+scheduled agent) instead of a standalone service. Install by copying `skill/` to
+`~/.claude/skills/pr-review-bot/`.
+
+It follows the same split as the service — deterministic GitHub work is **scripted**,
+only the five-vector review is left to the model:
+
+```
+skill/
+  SKILL.md                 thin orchestrator: run a script, branch on its exit code
+  scripts/
+    _lib.sh                shared: python detection, UTF-8 env, PR-URL parse, gh auth guard
+    fetch-pr.sh            fetch + state/own-PR/allowlist gates  → exit 0/2/3/4/5
+    post-review.sh         build the review envelope + POST      → prints html_url
+    check-addressed.sh     follow-up mechanical gates (GraphQL)  → exit 0/2
+    approve.sh             the only approve path (event=COMMENT is hard-wired elsewhere)
+  references/github-review.md   anchoring rules + the native-Windows-path gotcha
+```
+
+Slack stays model-driven (its MCP tools can't be called from bash); everything
+GitHub is `gh`. Smoke-tested against `Actual-Reality/customer-portal`.
+
 ## Notes / limitations
 - **Auth is prototype-grade:** reuses a personal Slack token + GitHub PAT. Harden to
   a dedicated bot identity (GitHub App + Slack bot user) before wider use.
