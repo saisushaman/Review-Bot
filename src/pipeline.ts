@@ -6,6 +6,17 @@ import { reviewPr, verifyFix, type Severity } from "./review.js";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
 
+// Cache of completed fix-verification verdicts, keyed by PR head SHA + review-comment signature.
+// The verify step spawns a headless `claude -p` — the single most expensive thing the bot does.
+// A held PR (CI green, not blocked, but not all findings addressed yet) is re-checked by the 2-min
+// self-heal sweep indefinitely; without this it would re-run that `claude -p` every 2 minutes for
+// an answer that CANNOT change until the author pushes a new commit (new head SHA) or a reviewer
+// adds a comment. Both are captured in the key, so a genuine change busts the cache and re-verifies.
+// Only COMPLETE verdicts are cached (VerifyResult.ok) — fail-closed/incomplete runs are retried.
+const verifyMemo = new Map<string, boolean>();
+const verifyKey = (owner: string, repo: string, n: number, headOid: string, commentSig: string) =>
+  `${owner}/${repo}#${n}@${headOid}:${commentSig}`;
+
 async function reactionNames(client: WebClient, ts: string): Promise<string[]> {
   const res = await client.reactions.get({ channel: config.slack.channelId, timestamp: ts });
   const reactions = (res.message as { reactions?: Array<{ name: string }> } | undefined)?.reactions ?? [];
@@ -193,11 +204,27 @@ export async function maybeApprove(
   // the sweep re-checks as the author pushes more fixes.
   const findings = await gh.allReviewComments(owner, repo, number);
   if (findings.length) {
-    const diff = await gh.getPrDiff(owner, repo, number);
-    const { allAddressed } = await verifyFix(
-      findings.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
-      diff
-    );
+    // Signature of the finding set (count + each path:line) — changes if a reviewer adds/moves a
+    // comment. Combined with the head SHA it fully determines the verify verdict, so we can reuse a
+    // cached verdict instead of re-spawning claude -p when nothing has changed since the last hold.
+    const commentSig = `${findings.length}|${findings
+      .map((c) => `${c.path}:${c.line}`)
+      .sort()
+      .join(",")}`;
+    const key = verifyKey(owner, repo, number, meta.headOid, commentSig);
+
+    let allAddressed: boolean;
+    if (verifyMemo.has(key)) {
+      allAddressed = verifyMemo.get(key)!; // unchanged since last verify → skip the claude -p run
+    } else {
+      const diff = await gh.getPrDiff(owner, repo, number);
+      const res = await verifyFix(
+        findings.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
+        diff
+      );
+      allAddressed = res.allAddressed;
+      if (res.ok) verifyMemo.set(key, res.allAddressed); // cache only complete verdicts
+    }
     if (!allAddressed) return; // not every comment is addressed in the commits yet → hold
   }
 

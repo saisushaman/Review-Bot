@@ -20,10 +20,15 @@ export interface ReviewComment {
   body: string; // caller prefixes severity, e.g. "**[High]** …"
 }
 
-/** The login the token acts as — used for own-PR skip and "already approved" checks. */
+/** The login the token acts as — used for own-PR skip and "already approved" checks.
+ *  Memoized for the process lifetime: the token's identity never changes, so re-fetching it on
+ *  every review/approve (and every 2-min sweep) was a wasted API round-trip. */
+let _authLogin: string | null = null;
 export async function authUserLogin(): Promise<string> {
+  if (_authLogin) return _authLogin;
   const { data } = await octokit.users.getAuthenticated();
-  return data.login;
+  _authLogin = data.login;
+  return _authLogin;
 }
 
 export async function getPr(owner: string, repo: string, number: number): Promise<PrMeta> {

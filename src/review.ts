@@ -129,6 +129,9 @@ Every concern goes in findings[]; the summary never describes a specific issue. 
 export interface VerifyResult {
   allAddressed: boolean;
   unaddressed: string[]; // human-readable list of findings NOT yet addressed
+  ok: boolean; // true when verification ran to a COMPLETE verdict (safe to cache); false on
+  // error/incomplete (fail-closed) — the caller must NOT cache these so a transient
+  // claude -p failure is retried rather than sticking.
 }
 
 /**
@@ -140,7 +143,7 @@ export interface VerifyResult {
  * the bot never approves on an unverified fix.
  */
 export async function verifyFix(findings: Finding[], prDiff: string): Promise<VerifyResult> {
-  if (findings.length === 0) return { allAddressed: true, unaddressed: [] };
+  if (findings.length === 0) return { allAddressed: true, unaddressed: [], ok: true };
   const list = findings.map((f, i) => `${i}. ${f.path}:${f.line} — ${f.body}`).join("\n");
   const prompt = `You are checking whether prior code-review findings were ADDRESSED in the CURRENT state of a pull request. For EACH finding, decide if the diff below resolves it.
 
@@ -162,13 +165,14 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of exactly 
       text
     );
     const verdicts = parsed.verdicts ?? [];
-    // Incomplete coverage → treat as not-verified (fail closed).
-    if (verdicts.length < findings.length) return { allAddressed: false, unaddressed: ["(verification incomplete)"] };
+    // Incomplete coverage → treat as not-verified (fail closed, don't cache).
+    if (verdicts.length < findings.length)
+      return { allAddressed: false, unaddressed: ["(verification incomplete)"], ok: false };
     const unaddressed = verdicts
       .filter((v) => v.addressed !== true)
       .map((v) => findings[v.i ?? -1]?.body?.slice(0, 60) ?? `finding ${v.i}`);
-    return { allAddressed: unaddressed.length === 0, unaddressed };
+    return { allAddressed: unaddressed.length === 0, unaddressed, ok: true };
   } catch {
-    return { allAddressed: false, unaddressed: ["(verification failed to run)"] };
+    return { allAddressed: false, unaddressed: ["(verification failed to run)"], ok: false };
   }
 }
