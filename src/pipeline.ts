@@ -92,35 +92,51 @@ export async function handleReviewRequest(
     return; // leave :eyes: so it isn't re-picked
   }
 
-  const diff = await gh.getPrDiff(owner, repo, number);
-  const result = await reviewPr(meta, diff);
+  // Everything past the claim is wrapped: if the review can't be produced/posted even after the
+  // claude -p retries, DON'T leave the PR silently claimed-but-unreviewed (that's how the
+  // 2026-07-28 transient failures got stuck — :eyes: on, no review, never retried). Release our
+  // :eyes: and say so in-thread, so a re-post/re-tag re-triggers it.
+  try {
+    const diff = await gh.getPrDiff(owner, repo, number);
+    const result = await reviewPr(meta, diff);
 
-  // Split findings into those that anchor to a real diff line (posted inline) and those that
-  // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
-  // #31 ended up with a summary claiming findings but zero inline comments — never silently drop.
-  const anchor = gh.anchorableLines(diff);
-  const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
-  const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));
-  const overflow = ordered.filter((f) => !anchor.get(f.path)?.has(f.line));
-  const comments = inline.map((f) => ({
-    path: f.path,
-    line: f.line,
-    body: `**[${f.severity}]** ${f.body}`,
-  }));
+    // Split findings into those that anchor to a real diff line (posted inline) and those that
+    // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
+    // #31 ended up with a summary claiming findings but zero inline comments — never silently drop.
+    const anchor = gh.anchorableLines(diff);
+    const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
+    const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));
+    const overflow = ordered.filter((f) => !anchor.get(f.path)?.has(f.line));
+    const comments = inline.map((f) => ({
+      path: f.path,
+      line: f.line,
+      body: `**[${f.severity}]** ${f.body}`,
+    }));
 
-  const tally = (["High", "Medium", "Low"] as Severity[])
-    .map((s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`)
-    .join(" · ");
-  let body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
-  if (overflow.length) {
-    body +=
-      `\n\n---\n**Findings that couldn't be anchored to the diff (${overflow.length}):**\n` +
-      overflow.map((f) => `- **[${f.severity}]** \`${f.path}:${f.line}\` — ${f.body}`).join("\n");
+    const tally = (["High", "Medium", "Low"] as Severity[])
+      .map((s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`)
+      .join(" · ");
+    let body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
+    if (overflow.length) {
+      body +=
+        `\n\n---\n**Findings that couldn't be anchored to the diff (${overflow.length}):**\n` +
+        overflow.map((f) => `- **[${f.severity}]** \`${f.path}:${f.line}\` — ${f.body}`).join("\n");
+    }
+
+    const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
+    await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${url}`);
+    // Deliberately leave ONLY :eyes:. Approval happens in maybeApprove after the author responds.
+  } catch (err) {
+    await client.reactions
+      .remove({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji })
+      .catch(() => undefined);
+    await threadReply(
+      client,
+      ts,
+      `⚠️ Automated review failed after retries — unclaimed so it can be retried. Re-post or re-tag to trigger again. (${(err as Error).message.slice(0, 200)})`
+    ).catch(() => undefined);
+    throw err; // surface to the index.ts logger too
   }
-
-  const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
-  await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${url}`);
-  // Deliberately leave ONLY :eyes:. Approval happens in maybeApprove after the author responds.
 }
 
 /**

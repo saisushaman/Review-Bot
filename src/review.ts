@@ -37,12 +37,17 @@ OUTPUT CONTRACT — non-negotiable, this is what makes the review usable:
 - The number of findings you mention anywhere MUST equal findings.length. A summary that references a concern while findings is empty is a BUG and an invalid response.
 - If and only if the PR is genuinely clean, findings=[] and the summary says so plainly.`;
 
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /**
- * Run headless Claude Code one-shot. The prompt is piped via STDIN (never a shell arg), so
+ * ONE headless Claude Code invocation. The prompt is piped via STDIN (never a shell arg), so
  * untrusted diff content can never inject into the command line. Returns the assistant's final
- * text (the `result` field of `--output-format json`).
+ * text (the `result` field of `--output-format json`). Rejects on non-zero exit / timeout / spawn
+ * error. On a non-zero exit, claude writes its diagnostic to STDOUT (the JSON envelope with
+ * is_error/result), NOT stderr — so we surface stdout in the error, else failures look empty
+ * (which is exactly why the 2026-07-28 drops logged `exited 1:` with nothing after).
  */
-function runClaude(prompt: string, timeoutMs = 180_000): Promise<string> {
+function spawnClaudeOnce(prompt: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("claude", ["-p", "--output-format", "json"], {
       shell: process.platform === "win32", // resolve claude.cmd on Windows
@@ -61,7 +66,17 @@ function runClaude(prompt: string, timeoutMs = 180_000): Promise<string> {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`claude -p exited ${code}: ${err.slice(0, 500)}`));
+      if (code !== 0) {
+        let detail = err.trim();
+        try {
+          const env = JSON.parse(out) as { result?: string };
+          if (env.result) detail = String(env.result).slice(0, 500);
+        } catch {
+          /* stdout wasn't JSON — fall through to raw */
+        }
+        if (!detail) detail = out.trim().slice(0, 500) || "(no output on stdout/stderr)";
+        return reject(new Error(`claude -p exited ${code}: ${detail}`));
+      }
       try {
         const env = JSON.parse(out) as { result?: string; is_error?: boolean };
         if (env.is_error) return reject(new Error(`claude -p error: ${env.result ?? "unknown"}`));
@@ -73,6 +88,35 @@ function runClaude(prompt: string, timeoutMs = 180_000): Promise<string> {
     child.stdin.write(prompt);
     child.stdin.end();
   });
+}
+
+/**
+ * Headless Claude Code WITH retries. A single transient failure (momentary rate/usage limit, a
+ * network blip, a killed child) previously dropped an entire review — the request was already
+ * claimed with :eyes:, so it never came back. Retrying here rides the blip out within the same
+ * event so the review still completes. Retries on ANY spawn/exit/timeout error with backoff;
+ * throws the last error only after every attempt fails.
+ */
+async function runClaude(prompt: string, timeoutMs = 180_000, attempts = 3): Promise<string> {
+  const backoffMs = [5_000, 15_000, 30_000];
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await spawnClaudeOnce(prompt, timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      if (attempt < attempts - 1) {
+        const delay = backoffMs[attempt] ?? 30_000;
+        console.warn(
+          `[pr-review-bot] claude -p attempt ${attempt + 1}/${attempts} failed: ${
+            (e as Error).message
+          } — retrying in ${delay / 1000}s`
+        );
+        await sleepMs(delay);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /** Extract the first JSON object from model text (tolerate ```json fences / surrounding prose). */
