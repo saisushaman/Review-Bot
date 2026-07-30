@@ -1,4 +1,6 @@
 import "dotenv/config";
+import os from "node:os";
+import path from "node:path";
 
 function req(name: string): string {
   const v = process.env[name];
@@ -57,6 +59,12 @@ export const config = {
   githubWebhookSecret: opt("GITHUB_WEBHOOK_SECRET", ""),
   githubWebhookPort: Number(opt("GITHUB_WEBHOOK_PORT", "3100")),
   githubWebhookPath: opt("GITHUB_WEBHOOK_PATH", "/github/webhook"),
+  // Persistent record of PRs this bot reviewed (owner/repo#n → head SHA). The authoritative
+  // "is this PR ours?" source for the approve/addressed path — survives restarts, unlike a reaction.
+  reviewStatePath: opt(
+    "REVIEW_STATE_PATH",
+    path.join(os.homedir(), ".pr-review-bot", "review-state.json")
+  ),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */

@@ -3,6 +3,7 @@ import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
 import { reviewPr, verifyFix, type Severity } from "./review.js";
 import type { CiEvent } from "./webhook.js";
+import * as reviewState from "./reviewState.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
@@ -150,6 +151,9 @@ export async function handleReviewRequest(
     }
 
     const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
+    // Record the review in our durable state BEFORE the Slack reply — this is the authoritative
+    // "we reviewed this PR" fact the approve/addressed path gates on (see maybeApprove).
+    reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid);
     await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${url}`);
     // Deliberately leave ONLY :eyes:. Approval happens in maybeApprove after the author responds.
   } catch (err) {
@@ -188,11 +192,17 @@ export async function maybeApprove(
   // (incl. messages that merely mention the word) so the bot never :eyes:/approves on discussion.
   if (!isAddressedSignal(replyText)) return;
 
-  // Ownership gate: only handle threads on a PR THIS bot claimed — our OWN :eyes: on the request.
-  // Another bot's / a human's :eyes: does not make it ours (this is what caused the #137 mis-acks).
-  if (!(await botOwnsClaim(client, parentTs, botUserId))) return;
-
   const { owner, repo, number } = pr;
+
+  // Ownership gate: only handle threads on a PR WE reviewed. Authoritative source is our durable
+  // review record (survives restarts, can't be spoofed by another bot's :eyes:); we also accept our
+  // OWN :eyes: still being on the request, so PRs reviewed before this record existed keep working.
+  // A :eyes: from a human or another bot (e.g. Alden Assistant on #137) never counts.
+  const owned =
+    reviewState.hasReviewed(reviewState.prKey(owner, repo, number)) ||
+    (await botOwnsClaim(client, parentTs, botUserId));
+  if (!owned) return;
+
   const me = await gh.authUserLogin();
 
   // Acknowledge the signal with :eyes: on the reply so it's visible the bot caught it (even if it
