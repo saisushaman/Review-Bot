@@ -43,6 +43,12 @@ export const config = {
   skipOwnPrs: bool("SKIP_OWN_PRS", true),
   approveWhenAddressed: bool("APPROVE_WHEN_ADDRESSED", true),
   maxDiffBytes: Number(opt("MAX_DIFF_BYTES", "200000")),
+  // Optional cheaper/faster model for the mechanical fix-VERIFICATION step (`claude -p --model`).
+  // Empty = claude's default (currently Opus). Set e.g. `claude-haiku-4-5-20251001` to cut cost and
+  // latency on the verify pass. ⚠️ Verification is what gates approvals ("is the fix really in the
+  // commits?"); a weaker model can mis-judge and approve an unfixed PR. Only affects verify — the
+  // review pass is unchanged. Revert by clearing this var and restarting.
+  verifyModel: opt("VERIFY_MODEL", ""),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */

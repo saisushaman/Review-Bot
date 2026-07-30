@@ -47,9 +47,11 @@ const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * is_error/result), NOT stderr — so we surface stdout in the error, else failures look empty
  * (which is exactly why the 2026-07-28 drops logged `exited 1:` with nothing after).
  */
-function spawnClaudeOnce(prompt: string, timeoutMs: number): Promise<string> {
+function spawnClaudeOnce(prompt: string, timeoutMs: number, model?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("claude", ["-p", "--output-format", "json"], {
+    const args = ["-p", "--output-format", "json"];
+    if (model) args.push("--model", model); // optional cheaper model (e.g. verify pass)
+    const child = spawn("claude", args, {
       shell: process.platform === "win32", // resolve claude.cmd on Windows
     });
     let out = "";
@@ -97,12 +99,17 @@ function spawnClaudeOnce(prompt: string, timeoutMs: number): Promise<string> {
  * event so the review still completes. Retries on ANY spawn/exit/timeout error with backoff;
  * throws the last error only after every attempt fails.
  */
-async function runClaude(prompt: string, timeoutMs = 180_000, attempts = 3): Promise<string> {
+async function runClaude(
+  prompt: string,
+  timeoutMs = 180_000,
+  attempts = 3,
+  model?: string
+): Promise<string> {
   const backoffMs = [5_000, 15_000, 30_000];
   let lastErr: unknown;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      return await spawnClaudeOnce(prompt, timeoutMs);
+      return await spawnClaudeOnce(prompt, timeoutMs, model);
     } catch (e) {
       lastErr = e;
       if (attempt < attempts - 1) {
@@ -204,7 +211,8 @@ Judge fairly, not pedantically: mark addressed=true if the diff plausibly resolv
 Respond with ONLY a JSON object — no prose, no markdown fences — of exactly this shape, with ONE verdict per finding:
 {"verdicts": [{"i": <finding index int>, "addressed": true|false, "why": "<=12 words"}]}`;
   try {
-    const text = await runClaude(prompt, 150_000);
+    // Verify runs on config.verifyModel when set (e.g. Haiku) — cheaper/faster than the review pass.
+    const text = await runClaude(prompt, 150_000, 3, config.verifyModel || undefined);
     const parsed = extractJson<{ verdicts?: Array<{ i?: number; addressed?: boolean; why?: string }> }>(
       text
     );

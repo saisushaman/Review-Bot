@@ -113,6 +113,7 @@ safe (the `:eyes:` lock coordinates them) but wasteful.
 | `SKIP_OWN_PRS` | no (true) | Never review a PR authored by the token's own user |
 | `APPROVE_WHEN_ADDRESSED` | no (true) | Enable the verify-then-approve follow-up |
 | `MAX_DIFF_BYTES` | no (200000) | Cap on the diff sent to the reviewer |
+| `VERIFY_MODEL` | no (default/Opus) | Cheaper model for the **verify** pass only (`claude -p --model`), e.g. `claude-haiku-4-5-20251001`. ⚠️ Verify gates approvals — a weaker model can approve an unfixed PR. |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | no | **Unused** — engine is `claude -p` |
 
 ## Layout
