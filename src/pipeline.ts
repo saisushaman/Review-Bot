@@ -17,6 +17,16 @@ const verifyMemo = new Map<string, boolean>();
 const verifyKey = (owner: string, repo: string, n: number, headOid: string, commentSig: string) =>
   `${owner}/${repo}#${n}@${headOid}:${commentSig}`;
 
+// Cache of the newest "addressed" signal per PR-request message, validated against Slack's
+// `latest_reply` timestamp. The self-heal sweep runs every 2 min; re-fetching a thread's replies
+// when nothing new was posted is the dominant wasted call (a reviewed PR always has the bot's own
+// "review done" reply, so it always has a thread). If `latest_reply` is unchanged since we last
+// looked, the newest addressed signal cannot have changed, so we reuse the cached result and skip
+// the conversations.replies fetch. maybeApprove still runs each tick when a signal is cached, so CI
+// turning green on an otherwise-unchanged thread is still picked up.
+type CachedSignal = { user?: string; text?: string; ts?: string } | null;
+const signalCache = new Map<string, { latestReply: string; signal: CachedSignal }>();
+
 async function reactionNames(client: WebClient, ts: string): Promise<string[]> {
   const res = await client.reactions.get({ channel: config.slack.channelId, timestamp: ts });
   const reactions = (res.message as { reactions?: Array<{ name: string }> } | undefined)?.reactions ?? [];
@@ -262,25 +272,48 @@ export async function maybeApprove(
  */
 export async function reconcileApprovals(client: WebClient, botUserId: string): Promise<void> {
   const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 30 });
+  const seen = new Set<string>();
   for (const msg of hist.messages ?? []) {
-    const m = msg as { ts?: string; text?: string; reactions?: Array<{ name: string }> };
+    const m = msg as {
+      ts?: string;
+      text?: string;
+      reactions?: Array<{ name: string }>;
+      latest_reply?: string;
+    };
     if (!m.ts || !m.text) continue;
     if (!parsePrUrl(m.text) || !tagsRequiredUser(m.text)) continue;
     const reacts = (m.reactions ?? []).map((r) => r.name);
     if (!reacts.includes(config.claimEmoji)) continue; // not reviewed by us
     if (reacts.includes(config.approvedEmoji)) continue; // already approved
-    const thread = await client.conversations.replies({
-      channel: config.slack.channelId,
-      ts: m.ts,
-      limit: 50,
-    });
-    // newest first: the latest non-bot "addressed" reply is the signal to act on
-    const replies = (thread.messages ?? []).slice(1).reverse();
-    const signal = replies.find((r) => {
-      const rm = r as { user?: string; text?: string };
-      return rm.user !== botUserId && isAddressedSignal(rm.text);
-    }) as { user?: string; text?: string; ts?: string } | undefined;
+    seen.add(m.ts);
+
+    // No thread ⇒ no "addressed" reply can exist ⇒ nothing to approve this tick.
+    if (!m.latest_reply) continue;
+
+    let signal: CachedSignal;
+    const cached = signalCache.get(m.ts);
+    if (cached && cached.latestReply === m.latest_reply) {
+      signal = cached.signal; // thread unchanged since last tick — reuse, skip the replies fetch
+    } else {
+      const thread = await client.conversations.replies({
+        channel: config.slack.channelId,
+        ts: m.ts,
+        limit: 50,
+      });
+      // newest first: the latest non-bot "addressed" reply is the signal to act on
+      const replies = (thread.messages ?? []).slice(1).reverse();
+      signal =
+        (replies.find((r) => {
+          const rm = r as { user?: string; text?: string };
+          return rm.user !== botUserId && isAddressedSignal(rm.text);
+        }) as CachedSignal) ?? null;
+      signalCache.set(m.ts, { latestReply: m.latest_reply, signal });
+    }
+
     if (!signal) continue;
     await maybeApprove(client, m.ts, m.text, signal.user ?? "", botUserId, signal.ts, signal.text);
   }
+  // Keep the cache bounded: drop entries for messages no longer in the reviewed-unapproved window
+  // (approved, or scrolled past the history limit).
+  for (const key of signalCache.keys()) if (!seen.has(key)) signalCache.delete(key);
 }
