@@ -138,6 +138,54 @@ async function produceReview(owner: string, repo: string, number: number): Promi
 }
 
 /**
+ * After a review posts: if it raised inline comments (findings > 0), point to them and wait for the
+ * author (leave :eyes:). If it's CLEAN (0 comments), there's nothing to fix — so approve the PR and
+ * ✅ the PR post, GATED on the same safety checks as any approval (still OPEN, CI green, no other
+ * reviewer's CHANGES_REQUESTED). Never merges. If a gate blocks, say the review was clean but hold.
+ */
+async function finalizeReview(
+  client: WebClient,
+  prPostTs: string,
+  replyTs: string,
+  owner: string,
+  repo: string,
+  number: number,
+  url: string,
+  findings: number
+): Promise<void> {
+  const key = `${owner}/${repo}#${number}`;
+  if (findings > 0) {
+    await threadReply(client, replyTs, `👀 Automated review done — see comments: ${url}`);
+    return; // leave :eyes:; approval waits for the author to address the comments
+  }
+  // Clean review (no inline comments) → approve + ✅ if the gates are clear.
+  const me = await gh.authUserLogin();
+  if (await gh.hasApprovedBy(owner, repo, number, me)) {
+    await threadReply(client, replyTs, `✅ Clean review, no issues — already approved ${key}.`);
+    return;
+  }
+  const meta = await gh.getPr(owner, repo, number);
+  const problems: string[] = [];
+  if (meta.state !== "open" || meta.merged) problems.push(`PR is ${meta.merged ? "merged" : meta.state}`);
+  if (!(await gh.ciGreen(owner, repo, meta.headOid))) problems.push("CI isn't green");
+  if (await gh.changesRequested(owner, repo, number)) problems.push("another reviewer requested changes");
+  if (problems.length) {
+    await threadReply(client, replyTs, `✅ Clean review — no issues found. Holding approval: ${problems.join("; ")}.`);
+    return;
+  }
+  try {
+    await gh.approvePr(owner, repo, number, "Automated review found no issues — approving.");
+  } catch (err) {
+    await threadReply(client, replyTs, `Clean review — no issues, but couldn't approve ${key}: ${(err as Error).message.slice(0, 120)}`);
+    return;
+  }
+  await client.reactions
+    .add({ channel: config.slack.channelId, timestamp: prPostTs, name: config.approvedEmoji })
+    .catch(() => undefined);
+  await threadReply(client, replyTs, `✅ Clean review — no issues found. Approved ${key}.`);
+}
+
+/**
  * A new PR-review request landed in the channel. Eligibility = PR URL + tags the
  * required user + no :eyes:. Debounce, claim, review, post, reply. Leaves :eyes:
  * only — approval is a separate step (see maybeApprove).
@@ -180,8 +228,8 @@ export async function handleReviewRequest(
     console.warn(`[pr-review-bot] review failed for ${owner}/${repo}#${number}: ${outcome.error}`);
     return;
   }
-  await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${outcome.url}`);
-  // Deliberately leave ONLY :eyes:. Approval happens in maybeApprove after the author responds.
+  // Comments → "see comments" (wait for author). Clean → approve + ✅ (gated). See finalizeReview.
+  await finalizeReview(client, ts, ts, owner, repo, number, outcome.url, outcome.findings);
 }
 
 /**
@@ -511,7 +559,7 @@ export async function handleMention(
       if (outcome.kind === "skipped") await threadReply(client, replyThread, `skipping — ${outcome.reason}.`);
       else if (outcome.kind === "failed")
         await threadReply(client, replyThread, `couldn't ${parsed.command} ${key}: ${outcome.error.slice(0, 200)}`);
-      else await threadReply(client, replyThread, `👀 ${parsed.command} done — see comments: ${outcome.url}`);
+      else await finalizeReview(client, threadTs ?? messageTs, replyThread, owner, repo, number, outcome.url, outcome.findings);
     } finally {
       inflight.release(key);
     }
