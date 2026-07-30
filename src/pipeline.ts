@@ -543,12 +543,14 @@ export async function handleMention(
   }
 
   if (parsed.command === "review" || parsed.command === "re-review") {
-    if (parsed.command === "re-review") {
-      const meta = await gh.getPr(owner, repo, number).catch(() => null);
-      if (meta && reviewState.reviewedSha(key) === meta.headOid) {
-        await threadReply(client, replyThread, `already reviewed ${key} at this commit — nothing new to look at.`);
-        return;
-      }
+    // SHA guard on BOTH review and re-review: never re-review the same commit. This is the fix for
+    // "asking for too many reviews" — a repeat @bot review on an unchanged PR replies once that
+    // there's nothing new, instead of running (and re-posting) another full review. Only a new
+    // commit (head SHA changes) gets a fresh pass.
+    const meta = await gh.getPr(owner, repo, number).catch(() => null);
+    if (meta && reviewState.reviewedSha(key) === meta.headOid) {
+      await threadReply(client, replyThread, `already reviewed ${key} at this commit — nothing new to look at.`);
+      return;
     }
     if (!inflight.claim(key, parsed.command)) {
       await threadReply(client, replyThread, `already reviewing ${key} — hang tight.`);
