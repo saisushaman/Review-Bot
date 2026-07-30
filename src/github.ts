@@ -185,22 +185,6 @@ export async function hasApprovedBy(
   return data.some((r) => r.user?.login === login && r.state === "APPROVED");
 }
 
-/**
- * True if `login` posted ANY review (COMMENTED / APPROVED / CHANGES_REQUESTED) on the PR — the
- * authoritative "did WE actually review this?" check. A `:eyes:` reaction on the Slack request is
- * NOT proof: humans and other bots (e.g. Alden Assistant) claim with `:eyes:` too, which caused the
- * bot to ack "addressed" on a PR it never reviewed (TMASA #137).
- */
-export async function hasReviewedBy(
-  owner: string,
-  repo: string,
-  number: number,
-  login: string
-): Promise<boolean> {
-  const { data } = await octokit.pulls.listReviews({ owner, repo, pull_number: number, per_page: 100 });
-  return data.some((r) => r.user?.login === login);
-}
-
 /** All review threads authored by `login`, with their resolved state (GraphQL). */
 export async function botReviewThreadsResolved(
   owner: string,

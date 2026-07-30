@@ -34,6 +34,21 @@ async function reactionNames(client: WebClient, ts: string): Promise<string[]> {
   return reactions.map((r) => r.name);
 }
 
+/**
+ * Does THIS bot own the PR request — i.e. is OUR OWN :eyes: on the parent message? This is the one
+ * source of truth for "is this mine to handle." A :eyes: from a human or another bot (e.g. Alden
+ * Assistant, which also claims with :eyes:) does NOT count — checking for merely *some* :eyes: is
+ * what made the bot ack "addressed" on TMASA #137, a PR it never touched. Because a failed review
+ * releases our :eyes: (handleReviewRequest), our :eyes: being present reliably means we reviewed it.
+ */
+async function botOwnsClaim(client: WebClient, parentTs: string, botUserId: string): Promise<boolean> {
+  const res = await client.reactions.get({ channel: config.slack.channelId, timestamp: parentTs });
+  const reactions =
+    (res.message as { reactions?: Array<{ name: string; users?: string[] }> } | undefined)?.reactions ?? [];
+  const eyes = reactions.find((r) => r.name === config.claimEmoji);
+  return !!eyes && (eyes.users ?? []).includes(botUserId);
+}
+
 async function threadReply(client: WebClient, threadTs: string, text: string): Promise<void> {
   await client.chat.postMessage({ channel: config.slack.channelId, thread_ts: threadTs, text });
 }
@@ -173,13 +188,12 @@ export async function maybeApprove(
   // (incl. messages that merely mention the word) so the bot never :eyes:/approves on discussion.
   if (!isAddressedSignal(replyText)) return;
 
+  // Ownership gate: only handle threads on a PR THIS bot claimed — our OWN :eyes: on the request.
+  // Another bot's / a human's :eyes: does not make it ours (this is what caused the #137 mis-acks).
+  if (!(await botOwnsClaim(client, parentTs, botUserId))) return;
+
   const { owner, repo, number } = pr;
   const me = await gh.authUserLogin();
-
-  // Only engage on a PR OUR bot ACTUALLY reviewed. A bare :eyes: on the parent is NOT proof — humans
-  // and OTHER bots (e.g. Alden Assistant) claim with :eyes: too, which made the bot ack "addressed"
-  // on TMASA #137, a PR it never reviewed. The authoritative signal is a review by our GH identity.
-  if (!(await gh.hasReviewedBy(owner, repo, number, me))) return;
 
   // Acknowledge the signal with :eyes: on the reply so it's visible the bot caught it (even if it
   // then holds, e.g. CI not green). Idempotent; swallow any error.
