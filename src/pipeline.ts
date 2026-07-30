@@ -484,10 +484,15 @@ export async function handleMention(
   }
   const key = `${owner}/${repo}#${number}`;
 
-  // Ack the mention.
-  await client.reactions
-    .add({ channel: config.slack.channelId, timestamp: messageTs, name: config.claimEmoji })
-    .catch(() => undefined);
+  // Claim :eyes: on BOTH the mention AND the PR post (thread root) — the thread root is the channel
+  // message everyone looks at, so that's the visible "this is mine" marker. Dedupe when the mention
+  // IS the PR post (a top-level mention with the link). Idempotent; swallow errors.
+  const eyesTargets = [...new Set([messageTs, threadTs].filter((t): t is string => !!t))];
+  for (const t of eyesTargets) {
+    await client.reactions
+      .add({ channel: config.slack.channelId, timestamp: t, name: config.claimEmoji })
+      .catch(() => undefined);
+  }
 
   if (parsed.command === "review" || parsed.command === "re-review") {
     if (parsed.command === "re-review") {
