@@ -51,8 +51,15 @@ function spawnClaudeOnce(prompt: string, timeoutMs: number, model?: string): Pro
   return new Promise((resolve, reject) => {
     const args = ["-p", "--output-format", "json"];
     if (model) args.push("--model", model); // optional cheaper model (e.g. verify pass)
+    // Force SUBSCRIPTION auth: if ANTHROPIC_API_KEY is present in the env, `claude -p` bills the
+    // metered API instead of the Claude subscription — and a stale/empty-credit key then makes every
+    // review fail with "Credit balance is too low" (hit live 2026-07-30). This bot is designed to run
+    // on the subscription (no API credits), so strip the key from the child env unconditionally.
+    const env = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
     const child = spawn("claude", args, {
       shell: process.platform === "win32", // resolve claude.cmd on Windows
+      env,
     });
     let out = "";
     let err = "";

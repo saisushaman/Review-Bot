@@ -33,8 +33,11 @@ export const config = {
       .filter(Boolean),
   },
   anthropic: {
-    // Unused now — the bot reviews via headless Claude Code (`claude -p`) on your subscription,
-    // not the metered API. Kept optional so an old key in .env doesn't matter either way.
+    // Unused — the bot reviews via headless Claude Code (`claude -p`) on your Claude SUBSCRIPTION,
+    // not the metered API. ⚠️ An ANTHROPIC_API_KEY in the env is NOT harmless: `claude -p` would pick
+    // it up and bill the metered API instead of the subscription, and a low-credit key then fails
+    // every review with "Credit balance is too low" (hit live 2026-07-30). review.ts now strips the
+    // key from the claude -p child env so it always uses the subscription regardless of this.
     apiKey: opt("ANTHROPIC_API_KEY", ""),
     model: opt("ANTHROPIC_MODEL", "claude-opus-4-8"),
   },
