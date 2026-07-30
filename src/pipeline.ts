@@ -179,10 +179,11 @@ async function finalizeReview(
     await threadReply(client, replyTs, `Clean review — no issues, but couldn't approve ${key}: ${(err as Error).message.slice(0, 120)}`);
     return;
   }
+  // Approved reply FIRST, then the ✅ tick on the PR post (user-set order).
+  await threadReply(client, replyTs, `✅ Clean review — no issues found. Approved ${key}.`);
   await client.reactions
     .add({ channel: config.slack.channelId, timestamp: prPostTs, name: config.approvedEmoji })
     .catch(() => undefined);
-  await threadReply(client, replyTs, `✅ Clean review — no issues found. Approved ${key}.`);
 }
 
 /**
@@ -290,25 +291,22 @@ export async function maybeApprove(
   // — the author's "addressed" signal + no CHANGES_REQUESTED is the bar (user-set 2026-07-17).
   if (await gh.changesRequested(owner, repo, number)) return;
 
-  // Duplicate guard — never approve when a competing OPEN PR touches the same SOURCE files. Ignore
-  // incidental shared files (the append-only SOW ledger, docs, markdown, changelogs) — nearly every
-  // PR touches those, so counting them made the guard fire on essentially everything (e.g. #98 held
-  // only because it shares docs/sow/ledger.md with an unrelated docs PR). Only a shared code file
-  // signals a real competing implementation.
-  const codeFile = (f: string) =>
-    !/\.(md|mdx|txt|rst)$/i.test(f) && !/(^|\/)docs\//i.test(f) && !/ledger|changelog/i.test(f);
-  const files = (await gh.changedFilePaths(owner, repo, number)).filter(codeFile);
-  const dupes = files.length ? await gh.openPrsTouchingFiles(owner, repo, number, files) : [];
+  // Duplicate guard — hold ONLY for a GENUINE competing duplicate: another open PR for the SAME
+  // ticket, or (when neither carries a ticket) one with a STRONG changed-file overlap. Merely sharing
+  // one incidental file (a router/index/config) is NOT competition — that was the #45↔#42 false
+  // positive. Different tickets are never competing. See gh.competingOpenPrs.
+  const myTicket = gh.ticketKey(meta.title, meta.headRefName);
+  const myFiles = (await gh.changedFilePaths(owner, repo, number)).filter(gh.isCodeFile);
+  const dupes =
+    myTicket || myFiles.length ? await gh.competingOpenPrs(owner, repo, number, myTicket, myFiles) : [];
   if (dupes.length) {
-    // Post the "competing PR" note AT MOST ONCE per thread, then hold silently on later replies —
-    // maybeApprove runs on every reply, so re-posting it each time spams the thread (user-set
-    // 2026-07-17). The marker is a stable substring of the note itself.
+    // Post the "competing PR" note AT MOST ONCE per thread, then hold silently on later replies.
     const MARK = "holding approval: this competes with";
     if (!(await threadHasNote(client, parentTs, MARK))) {
       await threadReply(
         client,
         parentTs,
-        `Fix looks addressed & CI is green, but ${MARK} #${dupes.join(", #")} (same file(s)). A human should pick one — I don't close/merge PRs.`
+        `Fix looks addressed & CI is green, but ${MARK} #${dupes.join(", #")} (same ticket/implementation). A human should pick one — I don't close/merge PRs.`
       );
     }
     return;
@@ -346,12 +344,11 @@ export async function maybeApprove(
   }
 
   await gh.approvePr(owner, repo, number);
-  await client.reactions.add({
-    channel: config.slack.channelId,
-    timestamp: parentTs,
-    name: config.approvedEmoji,
-  });
+  // Post the approved reply FIRST, THEN the ✅ tick on the PR post (user-set order).
   await threadReply(client, parentTs, "✅ Approved — CI green.");
+  await client.reactions
+    .add({ channel: config.slack.channelId, timestamp: parentTs, name: config.approvedEmoji })
+    .catch(() => undefined);
 }
 
 /**
@@ -463,6 +460,7 @@ async function messageText(client: WebClient, ts: string): Promise<string> {
 async function approveOnRequest(
   client: WebClient,
   replyThread: string,
+  prPostTs: string,
   owner: string,
   repo: string,
   number: number
@@ -491,7 +489,11 @@ async function approveOnRequest(
     await threadReply(client, replyThread, `couldn't approve ${key}: ${(err as Error).message.slice(0, 150)}`);
     return;
   }
+  // Approved reply FIRST, then the ✅ tick on the PR post (user-set order).
   await threadReply(client, replyThread, `✅ approved ${key} — CI green, no changes requested.`);
+  await client.reactions
+    .add({ channel: config.slack.channelId, timestamp: prPostTs, name: config.approvedEmoji })
+    .catch(() => undefined);
 }
 
 /**
@@ -578,7 +580,7 @@ export async function handleMention(
   }
 
   if (parsed.command === "approve") {
-    await approveOnRequest(client, replyThread, owner, repo, number);
+    await approveOnRequest(client, replyThread, threadTs ?? messageTs, owner, repo, number);
     return;
   }
 }

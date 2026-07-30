@@ -9,6 +9,7 @@ export interface PrMeta {
   state: string; // "open" | "closed"
   merged: boolean; // true once the PR has been merged
   headOid: string;
+  headRefName: string; // the PR's head branch (used for ticket detection in the duplicate guard)
   changedFiles: number;
   additions: number;
   deletions: number;
@@ -39,6 +40,7 @@ export async function getPr(owner: string, repo: string, number: number): Promis
     state: data.state,
     merged: data.merged ?? false,
     headOid: data.head.sha,
+    headRefName: data.head.ref ?? "",
     changedFiles: data.changed_files,
     additions: data.additions,
     deletions: data.deletions,
@@ -205,24 +207,51 @@ export async function botReviewThreadsResolved(
   return { any: mine.length > 0, allResolved: mine.length > 0 && mine.every((t) => t.isResolved) };
 }
 
-/** Other OPEN PRs in the repo touching any of `files` (duplicate-guard input). */
-export async function openPrsTouchingFiles(
+/** A changed path that signals a real implementation (not an incidental doc/ledger/changelog). */
+export function isCodeFile(f: string): boolean {
+  return !/\.(md|mdx|txt|rst)$/i.test(f) && !/(^|\/)docs\//i.test(f) && !/ledger|changelog/i.test(f);
+}
+
+/** Extract a ticket key like "PORTAL-69" / "PLANE-26" from a PR title or branch, or null. */
+export function ticketKey(title: string, headRef: string): string | null {
+  const m = `${title} ${headRef}`.match(/\b([A-Z][A-Z0-9]{1,9}-\d+)\b/);
+  return m ? m[1].toUpperCase() : null;
+}
+
+/**
+ * Other OPEN PRs that GENUINELY compete with this one — a true duplicate where only one should
+ * merge — NOT merely a PR that happens to touch a shared file. Competition means:
+ *   1. the SAME ticket key (both PRs are the same PROJ-NNN), or
+ *   2. when NEITHER PR carries a ticket, a STRONG changed-file overlap (≥2 shared code files AND
+ *      ≥60% of the smaller PR's code files), i.e. clearly the same implementation.
+ * A single incidentally-shared file (a router, an index, a config) is NOT competition — that was the
+ * #45↔#42 false positive. Different tickets are never treated as competing.
+ */
+export async function competingOpenPrs(
   owner: string,
   repo: string,
   excludeNumber: number,
-  files: string[]
+  myTicket: string | null,
+  myCodeFiles: string[]
 ): Promise<number[]> {
+  const mySet = new Set(myCodeFiles);
   const { data: prs } = await octokit.pulls.list({ owner, repo, state: "open", per_page: 50 });
   const hits: number[] = [];
   for (const pr of prs) {
     if (pr.number === excludeNumber) continue;
-    const { data: prFiles } = await octokit.pulls.listFiles({
-      owner,
-      repo,
-      pull_number: pr.number,
-      per_page: 100,
-    });
-    if (prFiles.some((f) => files.includes(f.filename))) hits.push(pr.number);
+    const theirTicket = ticketKey(pr.title, pr.head?.ref ?? "");
+    if (myTicket || theirTicket) {
+      // At least one side has a ticket → competing ONLY if the tickets are the SAME.
+      if (myTicket && theirTicket && myTicket === theirTicket) hits.push(pr.number);
+      continue; // different (or one-sided) tickets → NOT competing
+    }
+    // Neither side has a ticket → fall back to a strong changed-file overlap.
+    if (mySet.size === 0) continue;
+    const { data: theirFiles } = await octokit.pulls.listFiles({ owner, repo, pull_number: pr.number, per_page: 100 });
+    const theirCode = theirFiles.map((f) => f.filename).filter(isCodeFile);
+    const shared = theirCode.filter((f) => mySet.has(f));
+    const smaller = Math.min(mySet.size, theirCode.length);
+    if (shared.length >= 2 && smaller > 0 && shared.length / smaller >= 0.6) hits.push(pr.number);
   }
   return hits;
 }
