@@ -312,35 +312,34 @@ export async function maybeApprove(
     return;
   }
 
-  // VERIFY the fixes are actually in the commits before approving (user-set 2026-07-17): "addressed"
-  // must mean the code changed to resolve the findings, not just the word. Check the CURRENT PR diff
-  // against EVERY review comment — the bot's own automated review AND the other reviewers'
-  // (codex/copilot/gemini/charlie/humans). Hold SILENTLY (no nag) if any finding isn't addressed;
-  // the sweep re-checks as the author pushes more fixes.
-  const findings = await gh.allReviewComments(owner, repo, number);
-  if (findings.length) {
-    // Signature of the finding set (count + each path:line) — changes if a reviewer adds/moves a
-    // comment. Combined with the head SHA it fully determines the verify verdict, so we can reuse a
-    // cached verdict instead of re-spawning claude -p when nothing has changed since the last hold.
-    const commentSig = `${findings.length}|${findings
-      .map((c) => `${c.path}:${c.line}`)
-      .sort()
-      .join(",")}`;
-    const key = verifyKey(owner, repo, number, meta.headOid, commentSig);
-
-    let allAddressed: boolean;
-    if (verifyMemo.has(key)) {
-      allAddressed = verifyMemo.get(key)!; // unchanged since last verify → skip the claude -p run
-    } else {
-      const diff = await gh.getPrDiff(owner, repo, number);
-      const res = await verifyFix(
-        findings.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
-        diff
-      );
-      allAddressed = res.allAddressed;
-      if (res.ok) verifyMemo.set(key, res.allAddressed); // cache only complete verdicts
+  // VERIFY (opt-in via VERIFY_FIXES_BEFORE_APPROVE, default OFF): re-check via claude -p that the
+  // findings are actually fixed in the commits before approving. Default trusts the author's
+  // "addressed" signal + the objective gates above (CI green, no CHANGES_REQUESTED, not a real
+  // duplicate) — "if they said addressed, approve it". Enable for stricter approvals.
+  if (config.verifyFixesBeforeApprove) {
+    const findings = await gh.allReviewComments(owner, repo, number);
+    if (findings.length) {
+      // Signature (count + each path:line) + head SHA fully determine the verdict → reuse the cache
+      // instead of re-spawning claude -p when nothing changed since the last hold.
+      const commentSig = `${findings.length}|${findings
+        .map((c) => `${c.path}:${c.line}`)
+        .sort()
+        .join(",")}`;
+      const key = verifyKey(owner, repo, number, meta.headOid, commentSig);
+      let allAddressed: boolean;
+      if (verifyMemo.has(key)) {
+        allAddressed = verifyMemo.get(key)!;
+      } else {
+        const diff = await gh.getPrDiff(owner, repo, number);
+        const res = await verifyFix(
+          findings.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
+          diff
+        );
+        allAddressed = res.allAddressed;
+        if (res.ok) verifyMemo.set(key, res.allAddressed);
+      }
+      if (!allAddressed) return; // not every comment addressed in the commits yet → hold
     }
-    if (!allAddressed) return; // not every comment is addressed in the commits yet → hold
   }
 
   await gh.approvePr(owner, repo, number);

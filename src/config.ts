@@ -47,6 +47,10 @@ export const config = {
   approvedEmoji: opt("APPROVED_EMOJI", "white_check_mark"),
   skipOwnPrs: bool("SKIP_OWN_PRS", true),
   approveWhenAddressed: bool("APPROVE_WHEN_ADDRESSED", true),
+  // When true, re-verify via claude -p that findings are actually fixed in the commits before
+  // approving on an "addressed" signal. Default FALSE — "if they said addressed, approve it": trust
+  // the author's signal + the objective gates (CI green, no CHANGES_REQUESTED, not a real duplicate).
+  verifyFixesBeforeApprove: bool("VERIFY_FIXES_BEFORE_APPROVE", false),
   maxDiffBytes: Number(opt("MAX_DIFF_BYTES", "200000")),
   // Optional cheaper/faster model for the mechanical fix-VERIFICATION step (`claude -p --model`).
   // Empty = claude's default (currently Opus). Set e.g. `claude-haiku-4-5-20251001` to cut cost and
