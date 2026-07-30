@@ -49,6 +49,14 @@ export const config = {
   // commits?"); a weaker model can mis-judge and approve an unfixed PR. Only affects verify — the
   // review pass is unchanged. Revert by clearing this var and restarting.
   verifyModel: opt("VERIFY_MODEL", ""),
+  // Event-driven CI (optional). When GITHUB_WEBHOOK_SECRET is set, the bot also runs a small HTTP
+  // server that GitHub posts check_suite/workflow_run/status webhooks to, so a PR held on pending
+  // CI is approved the INSTANT CI reports green — no waiting for the next 2-min poll (the poll stays
+  // as a fallback). Empty secret = server never starts (default, fully non-breaking). Needs a public
+  // HTTPS endpoint reachable by GitHub (a tunnel or host), since GitHub has no Socket-Mode equivalent.
+  githubWebhookSecret: opt("GITHUB_WEBHOOK_SECRET", ""),
+  githubWebhookPort: Number(opt("GITHUB_WEBHOOK_PORT", "3100")),
+  githubWebhookPath: opt("GITHUB_WEBHOOK_PATH", "/github/webhook"),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */

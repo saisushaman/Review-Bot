@@ -1,7 +1,8 @@
 import pkg from "@slack/bolt";
 const { App } = pkg;
 import { config } from "./config.js";
-import { handleReviewRequest, maybeApprove, reconcileApprovals } from "./pipeline.js";
+import { handleReviewRequest, maybeApprove, reconcileApprovals, handleCiComplete } from "./pipeline.js";
+import { startGithubWebhookServer } from "./webhook.js";
 
 // Socket Mode when an app-level token (xapp-…) is set: an outbound WebSocket to Slack, so there is
 // NO public Request URL / tunnel to rotate or re-verify (the quick-tunnel URL rotates on every
@@ -74,9 +75,14 @@ app.message(async ({ message, client }) => {
     );
   setInterval(sweep, RECONCILE_MS);
   void sweep(); // run one now on boot to catch anything missed while down
+
+  // Event-driven CI (optional): approve the instant GitHub reports CI green, instead of waiting for
+  // the next poll. Only starts when GITHUB_WEBHOOK_SECRET is set; the poll above stays as fallback.
+  const webhookOn = startGithubWebhookServer((e) => handleCiComplete(app.client, me, e));
+
   const mode = config.slack.appToken ? "Socket Mode (no tunnel)" : "HTTP (Events API + tunnel)";
   console.log(
-    `[pr-review-bot] listening — ${mode}  channel=${config.slack.channelId}  as=${me}  engine=headless-claude-code`
+    `[pr-review-bot] listening — ${mode}  channel=${config.slack.channelId}  as=${me}  engine=headless-claude-code  ci-webhook=${webhookOn ? "on" : "off (poll only)"}`
   );
   if (!config.slack.appToken) {
     console.log(

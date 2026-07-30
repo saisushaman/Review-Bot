@@ -2,6 +2,7 @@ import type { WebClient } from "@slack/web-api";
 import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
 import { reviewPr, verifyFix, type Severity } from "./review.js";
+import type { CiEvent } from "./webhook.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
@@ -270,50 +271,90 @@ export async function maybeApprove(
  * replies that arrived while the bot was down/restarting (Socket Mode does NOT replay missed
  * events), so approvals aren't silently dropped. Idempotent — maybeApprove re-checks everything.
  */
+type HistMsg = {
+  ts?: string;
+  text?: string;
+  reactions?: Array<{ name: string }>;
+  latest_reply?: string;
+};
+
+/**
+ * Run the approve check for ONE channel message (a PR-review request). Shared by the periodic sweep
+ * and the CI webhook so both behave identically. Returns the message ts if it is a tracked
+ * reviewed-but-unapproved candidate (so the caller can bound the signal cache), else null.
+ */
+async function tryApproveForMessage(
+  client: WebClient,
+  botUserId: string,
+  m: HistMsg
+): Promise<string | null> {
+  if (!m.ts || !m.text) return null;
+  if (!parsePrUrl(m.text) || !tagsRequiredUser(m.text)) return null;
+  const reacts = (m.reactions ?? []).map((r) => r.name);
+  if (!reacts.includes(config.claimEmoji)) return null; // not reviewed by us
+  if (reacts.includes(config.approvedEmoji)) return null; // already approved
+  // Tracked candidate from here on (report ts for cache bookkeeping regardless of outcome).
+
+  if (!m.latest_reply) return m.ts; // no thread ⇒ no "addressed" reply can exist yet
+
+  let signal: CachedSignal;
+  const cached = signalCache.get(m.ts);
+  if (cached && cached.latestReply === m.latest_reply) {
+    signal = cached.signal; // thread unchanged since last look — reuse, skip the replies fetch
+  } else {
+    const thread = await client.conversations.replies({
+      channel: config.slack.channelId,
+      ts: m.ts,
+      limit: 50,
+    });
+    // newest first: the latest non-bot "addressed" reply is the signal to act on
+    const replies = (thread.messages ?? []).slice(1).reverse();
+    signal =
+      (replies.find((r) => {
+        const rm = r as { user?: string; text?: string };
+        return rm.user !== botUserId && isAddressedSignal(rm.text);
+      }) as CachedSignal) ?? null;
+    signalCache.set(m.ts, { latestReply: m.latest_reply, signal });
+  }
+
+  if (signal) {
+    await maybeApprove(client, m.ts, m.text, signal.user ?? "", botUserId, signal.ts, signal.text);
+  }
+  return m.ts;
+}
+
 export async function reconcileApprovals(client: WebClient, botUserId: string): Promise<void> {
   const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 30 });
   const seen = new Set<string>();
   for (const msg of hist.messages ?? []) {
-    const m = msg as {
-      ts?: string;
-      text?: string;
-      reactions?: Array<{ name: string }>;
-      latest_reply?: string;
-    };
-    if (!m.ts || !m.text) continue;
-    if (!parsePrUrl(m.text) || !tagsRequiredUser(m.text)) continue;
-    const reacts = (m.reactions ?? []).map((r) => r.name);
-    if (!reacts.includes(config.claimEmoji)) continue; // not reviewed by us
-    if (reacts.includes(config.approvedEmoji)) continue; // already approved
-    seen.add(m.ts);
-
-    // No thread ⇒ no "addressed" reply can exist ⇒ nothing to approve this tick.
-    if (!m.latest_reply) continue;
-
-    let signal: CachedSignal;
-    const cached = signalCache.get(m.ts);
-    if (cached && cached.latestReply === m.latest_reply) {
-      signal = cached.signal; // thread unchanged since last tick — reuse, skip the replies fetch
-    } else {
-      const thread = await client.conversations.replies({
-        channel: config.slack.channelId,
-        ts: m.ts,
-        limit: 50,
-      });
-      // newest first: the latest non-bot "addressed" reply is the signal to act on
-      const replies = (thread.messages ?? []).slice(1).reverse();
-      signal =
-        (replies.find((r) => {
-          const rm = r as { user?: string; text?: string };
-          return rm.user !== botUserId && isAddressedSignal(rm.text);
-        }) as CachedSignal) ?? null;
-      signalCache.set(m.ts, { latestReply: m.latest_reply, signal });
-    }
-
-    if (!signal) continue;
-    await maybeApprove(client, m.ts, m.text, signal.user ?? "", botUserId, signal.ts, signal.text);
+    const ts = await tryApproveForMessage(client, botUserId, msg as HistMsg);
+    if (ts) seen.add(ts);
   }
   // Keep the cache bounded: drop entries for messages no longer in the reviewed-unapproved window
   // (approved, or scrolled past the history limit).
   for (const key of signalCache.keys()) if (!seen.has(key)) signalCache.delete(key);
+}
+
+/**
+ * A GitHub CI webhook fired (check_suite/workflow_run/status completed). Immediately run the approve
+ * check for the affected PR(s) — the instant, event-driven counterpart to the poll. maybeApprove
+ * re-checks everything (CI green, no CHANGES_REQUESTED, fix verified), so a spurious or duplicate
+ * event is harmless. Matches the CI event to channel messages by PR number when present; a bare
+ * `status` event (SHA only, no PR numbers) falls back to every reviewed-unapproved PR in that repo.
+ */
+export async function handleCiComplete(
+  client: WebClient,
+  botUserId: string,
+  e: CiEvent
+): Promise<void> {
+  const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 50 });
+  for (const msg of hist.messages ?? []) {
+    const m = msg as HistMsg;
+    const pr = m.text ? parsePrUrl(m.text) : null;
+    if (!pr) continue;
+    if (pr.owner.toLowerCase() !== e.owner.toLowerCase() || pr.repo.toLowerCase() !== e.repo.toLowerCase())
+      continue;
+    if (e.prNumbers.length && !e.prNumbers.includes(pr.number)) continue; // number known → target it
+    await tryApproveForMessage(client, botUserId, m);
+  }
 }

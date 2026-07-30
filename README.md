@@ -44,6 +44,19 @@ but-unapproved PRs and runs the same approve check — so an "addressed" reply t
 arrived while the bot was down/restarting (Socket Mode doesn't replay missed events)
 is still picked up.
 
+**Event-driven CI (optional):** if a PR is held only because CI is still running, the
+2-min sweep is what eventually notices CI going green. Set `GITHUB_WEBHOOK_SECRET` to
+also run a webhook receiver that approves the **instant** GitHub reports CI green
+(`check_suite` / `workflow_run` / `status` completed) — the poll stays as the
+fallback, so a missed webhook never drops an approval. This needs a **public HTTPS
+endpoint** GitHub can reach (a tunnel or host); GitHub has no Socket-Mode equivalent,
+so this is the one path that reintroduces inbound ingress. Left unset, the server
+never starts and behavior is unchanged. **Activate:** ① set `GITHUB_WEBHOOK_SECRET`
+(+ optional `GITHUB_WEBHOOK_PORT`, default 3100), ② expose `<host>/github/webhook`
+publicly, ③ add a repo/org webhook (Payload URL = that, `application/json`, the same
+secret, events: **Check suites**, **Workflow runs**, **Statuses**). Startup logs
+`ci-webhook=on` when it's live.
+
 **Scope boundary (hard):** the bot only reacts, comments, and **approves**. It never
 closes, merges, or requests-changes.
 
