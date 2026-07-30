@@ -1,8 +1,9 @@
 import pkg from "@slack/bolt";
 const { App } = pkg;
 import { config } from "./config.js";
-import { handleReviewRequest, maybeApprove, reconcileApprovals, handleCiComplete } from "./pipeline.js";
+import { handleReviewRequest, maybeApprove, reconcileApprovals, handleCiComplete, handleMention } from "./pipeline.js";
 import { startGithubWebhookServer } from "./webhook.js";
+import { mentionsBot } from "./mentions.js";
 
 // Socket Mode when an app-level token (xapp-…) is set: an outbound WebSocket to Slack, so there is
 // NO public Request URL / tunnel to rotate or re-verify (the quick-tunnel URL rotates on every
@@ -43,6 +44,12 @@ app.message(async ({ message, client }) => {
   const me = await resolveBotUserId();
 
   try {
+    // @-mention command surface takes precedence: if someone mentions the bot (and it's not the
+    // bot's own message), route to the command dispatcher instead of the review/approve paths.
+    if (m.user !== me && !m.bot_id && mentionsBot(m.text, me)) {
+      await handleMention(client, m.ts, m.thread_ts, m.text, me);
+      return;
+    }
     const isThreadReply = m.thread_ts && m.thread_ts !== m.ts;
     if (isThreadReply) {
       // Approve follow-up: need the parent (the original PR request) text.

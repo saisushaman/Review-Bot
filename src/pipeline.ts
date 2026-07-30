@@ -4,6 +4,8 @@ import * as gh from "./github.js";
 import { reviewPr, verifyFix, type Severity } from "./review.js";
 import type { CiEvent } from "./webhook.js";
 import * as reviewState from "./reviewState.js";
+import * as inflight from "./inflight.js";
+import * as mentions from "./mentions.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
@@ -74,6 +76,67 @@ async function threadHasNote(client: WebClient, threadTs: string, marker: string
   return (res.messages ?? []).some((m) => ((m as { text?: string }).text ?? "").includes(marker));
 }
 
+/** What a review attempt produced. No Slack side effects — the caller owns reactions/replies. */
+type ReviewOutcome =
+  | { kind: "skipped"; reason: string } // merged/closed/own-PR/not-allowed — nothing posted
+  | { kind: "posted"; url: string; findings: number }
+  | { kind: "failed"; error: string }; // transient (claude -p etc.) — caller should allow a retry
+
+/**
+ * Gates + review + post + record for ONE PR, with NO Slack reactions/replies (the caller drives
+ * those, because the inbound-request path and the @-mention path signal differently). Shared by
+ * handleReviewRequest and the mention `review`/`re-review` commands so the review itself is
+ * identical everywhere.
+ */
+async function produceReview(owner: string, repo: string, number: number): Promise<ReviewOutcome> {
+  const repoKey = `${owner}/${repo}`.toLowerCase();
+  if (config.github.repoAllowlist.length && !config.github.repoAllowlist.includes(repoKey))
+    return { kind: "skipped", reason: `${owner}/${repo} isn't on the review allowlist` };
+
+  const meta = await gh.getPr(owner, repo, number);
+  if (meta.merged || meta.state !== "open")
+    return {
+      kind: "skipped",
+      reason: `PR #${number} is ${meta.merged ? "already merged" : `already ${meta.state}`}; nothing to review`,
+    };
+
+  const me = await gh.authUserLogin();
+  if (config.skipOwnPrs && meta.authorLogin === me)
+    return { kind: "skipped", reason: "the bot doesn't review its owner's PRs" };
+
+  try {
+    const diff = await gh.getPrDiff(owner, repo, number);
+    const result = await reviewPr(meta, diff);
+
+    // Split findings into those that anchor to a real diff line (posted inline) and those that
+    // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
+    // #31 ended up with a summary claiming findings but zero inline comments — never silently drop.
+    const anchor = gh.anchorableLines(diff);
+    const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
+    const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));
+    const overflow = ordered.filter((f) => !anchor.get(f.path)?.has(f.line));
+    const comments = inline.map((f) => ({ path: f.path, line: f.line, body: `**[${f.severity}]** ${f.body}` }));
+
+    const tally = (["High", "Medium", "Low"] as Severity[])
+      .map((s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`)
+      .join(" · ");
+    let body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
+    if (overflow.length) {
+      body +=
+        `\n\n---\n**Findings that couldn't be anchored to the diff (${overflow.length}):**\n` +
+        overflow.map((f) => `- **[${f.severity}]** \`${f.path}:${f.line}\` — ${f.body}`).join("\n");
+    }
+
+    const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
+    // Record the review in our durable state — the authoritative "we reviewed this PR" fact the
+    // approve/addressed path gates on (see maybeApprove).
+    reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid);
+    return { kind: "posted", url, findings: result.findings.length };
+  } catch (err) {
+    return { kind: "failed", error: (err as Error).message };
+  }
+}
+
 /**
  * A new PR-review request landed in the channel. Eligibility = PR URL + tags the
  * required user + no :eyes:. Debounce, claim, review, post, reply. Leaves :eyes:
@@ -97,76 +160,28 @@ export async function handleReviewRequest(
   await client.reactions.add({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji });
 
   const { owner, repo, number } = pr;
-  const repoKey = `${owner}/${repo}`.toLowerCase();
-  if (config.github.repoAllowlist.length && !config.github.repoAllowlist.includes(repoKey)) {
-    await threadReply(client, ts, `Skipping — ${owner}/${repo} isn't on the review allowlist.`);
+  const outcome = await produceReview(owner, repo, number);
+  if (outcome.kind === "skipped") {
+    // Leave :eyes: on so a settled/own/not-allowed PR isn't re-picked; just note why.
+    await threadReply(client, ts, `Skipping — ${outcome.reason}.`);
     return;
   }
-
-  const meta = await gh.getPr(owner, repo, number);
-
-  // Already merged/closed before we got to it → nothing to review. Leave :eyes: so it isn't
-  // re-picked, note why in-thread, and stop (no GitHub review on a settled PR).
-  if (meta.merged || meta.state !== "open") {
-    const how = meta.merged ? "already merged" : `already ${meta.state}`;
-    await threadReply(client, ts, `Skipping — PR #${number} is ${how}; nothing to review.`);
-    return;
-  }
-
-  const me = await gh.authUserLogin();
-  if (config.skipOwnPrs && meta.authorLogin === me) {
-    await threadReply(client, ts, "Skipping — the bot doesn't review its owner's PRs.");
-    return; // leave :eyes: so it isn't re-picked
-  }
-
-  // Everything past the claim is wrapped: if the review can't be produced/posted even after the
-  // claude -p retries, DON'T leave the PR silently claimed-but-unreviewed (that's how the
-  // 2026-07-28 transient failures got stuck — :eyes: on, no review, never retried). Release our
-  // :eyes: and say so in-thread, so a re-post/re-tag re-triggers it.
-  try {
-    const diff = await gh.getPrDiff(owner, repo, number);
-    const result = await reviewPr(meta, diff);
-
-    // Split findings into those that anchor to a real diff line (posted inline) and those that
-    // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
-    // #31 ended up with a summary claiming findings but zero inline comments — never silently drop.
-    const anchor = gh.anchorableLines(diff);
-    const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
-    const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));
-    const overflow = ordered.filter((f) => !anchor.get(f.path)?.has(f.line));
-    const comments = inline.map((f) => ({
-      path: f.path,
-      line: f.line,
-      body: `**[${f.severity}]** ${f.body}`,
-    }));
-
-    const tally = (["High", "Medium", "Low"] as Severity[])
-      .map((s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`)
-      .join(" · ");
-    let body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
-    if (overflow.length) {
-      body +=
-        `\n\n---\n**Findings that couldn't be anchored to the diff (${overflow.length}):**\n` +
-        overflow.map((f) => `- **[${f.severity}]** \`${f.path}:${f.line}\` — ${f.body}`).join("\n");
-    }
-
-    const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
-    // Record the review in our durable state BEFORE the Slack reply — this is the authoritative
-    // "we reviewed this PR" fact the approve/addressed path gates on (see maybeApprove).
-    reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid);
-    await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${url}`);
-    // Deliberately leave ONLY :eyes:. Approval happens in maybeApprove after the author responds.
-  } catch (err) {
+  if (outcome.kind === "failed") {
+    // Don't leave the PR silently claimed-but-unreviewed after a transient failure (that's how the
+    // 2026-07-28 drops got stuck) — release :eyes: so a re-post/re-tag re-triggers it.
     await client.reactions
       .remove({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji })
       .catch(() => undefined);
     await threadReply(
       client,
       ts,
-      `⚠️ Automated review failed after retries — unclaimed so it can be retried. Re-post or re-tag to trigger again. (${(err as Error).message.slice(0, 200)})`
+      `⚠️ Automated review failed after retries — unclaimed so it can be retried. Re-post or re-tag to trigger again. (${outcome.error.slice(0, 200)})`
     ).catch(() => undefined);
-    throw err; // surface to the index.ts logger too
+    console.warn(`[pr-review-bot] review failed for ${owner}/${repo}#${number}: ${outcome.error}`);
+    return;
   }
+  await threadReply(client, ts, `👀 Automated review done — see comments in the reply thread: ${outcome.url}`);
+  // Deliberately leave ONLY :eyes:. Approval happens in maybeApprove after the author responds.
 }
 
 /**
@@ -383,5 +398,132 @@ export async function handleCiComplete(
       continue;
     if (e.prNumbers.length && !e.prNumbers.includes(pr.number)) continue; // number known → target it
     await tryApproveForMessage(client, botUserId, m);
+  }
+}
+
+/** Text of a single message (for resolving the PR from a thread root). */
+async function messageText(client: WebClient, ts: string): Promise<string> {
+  const res = await client.conversations.replies({ channel: config.slack.channelId, ts, limit: 1 });
+  return ((res.messages?.[0] as { text?: string } | undefined)?.text ?? "");
+}
+
+/**
+ * The `approve` command: gate-check (OPEN, CI green, no CHANGES_REQUESTED) then post a GitHub
+ * approval. This is "everything's green, sign off" — it does NOT verify findings (that's the
+ * `addressed`/auto path) and it NEVER merges. Blocked → say what's wrong (offer-to-fix comes later).
+ */
+async function approveOnRequest(
+  client: WebClient,
+  replyThread: string,
+  owner: string,
+  repo: string,
+  number: number
+): Promise<void> {
+  const key = `${owner}/${repo}#${number}`;
+  const me = await gh.authUserLogin();
+  if (await gh.hasApprovedBy(owner, repo, number, me)) {
+    await threadReply(client, replyThread, `already approved ${key}.`);
+    return;
+  }
+  const meta = await gh.getPr(owner, repo, number);
+  if (meta.state !== "open" || meta.merged) {
+    await threadReply(client, replyThread, `that PR is ${meta.merged ? "merged" : meta.state} — nothing to approve.`);
+    return;
+  }
+  const problems: string[] = [];
+  if (!(await gh.ciGreen(owner, repo, meta.headOid))) problems.push("CI isn't green");
+  if (await gh.changesRequested(owner, repo, number)) problems.push("a reviewer requested changes");
+  if (problems.length) {
+    await threadReply(client, replyThread, `can't approve ${key} yet — ${problems.join("; ")}.`);
+    return;
+  }
+  try {
+    await gh.approvePr(owner, repo, number, "Approval gates clear: CI green, no changes requested.");
+  } catch (err) {
+    await threadReply(client, replyThread, `couldn't approve ${key}: ${(err as Error).message.slice(0, 150)}`);
+    return;
+  }
+  await threadReply(client, replyThread, `✅ approved ${key} — CI green, no changes requested.`);
+}
+
+/**
+ * @-mention command surface (Alden parity, minus merge). Resolves the PR from the mention text or,
+ * for a thread reply, the thread root, then dispatches: help/status (instant), review/re-review
+ * (produceReview; re-review is SHA-guarded), addressed (verify-then-approve), approve (gate-check).
+ */
+export async function handleMention(
+  client: WebClient,
+  messageTs: string,
+  threadTs: string | undefined,
+  text: string,
+  botUserId: string
+): Promise<void> {
+  const parsed = mentions.parseMention(text);
+  const replyThread = threadTs ?? messageTs; // reply in the mention's thread (or start one on it)
+
+  if (parsed.command === "help") {
+    await threadReply(client, replyThread, mentions.HELP_TEXT);
+    return;
+  }
+  if (parsed.command === "status") {
+    await threadReply(client, replyThread, mentions.formatStatus(inflight.snapshot()));
+    return;
+  }
+
+  // Resolve the PR: from the mention text, else from the thread root.
+  let owner = parsed.owner;
+  let repo = parsed.repo;
+  let number = parsed.number;
+  if (number == null && threadTs) {
+    const rootPr = parsePrUrl(await messageText(client, threadTs));
+    if (rootPr) ({ owner, repo, number } = rootPr);
+  }
+  if (owner == null || repo == null || number == null) {
+    await threadReply(client, replyThread, mentions.NO_PR_TEXT);
+    return;
+  }
+  const key = `${owner}/${repo}#${number}`;
+
+  // Ack the mention.
+  await client.reactions
+    .add({ channel: config.slack.channelId, timestamp: messageTs, name: config.claimEmoji })
+    .catch(() => undefined);
+
+  if (parsed.command === "review" || parsed.command === "re-review") {
+    if (parsed.command === "re-review") {
+      const meta = await gh.getPr(owner, repo, number).catch(() => null);
+      if (meta && reviewState.reviewedSha(key) === meta.headOid) {
+        await threadReply(client, replyThread, `already reviewed ${key} at this commit — nothing new to look at.`);
+        return;
+      }
+    }
+    if (!inflight.claim(key, parsed.command)) {
+      await threadReply(client, replyThread, `already reviewing ${key} — hang tight.`);
+      return;
+    }
+    try {
+      const outcome = await produceReview(owner, repo, number);
+      if (outcome.kind === "skipped") await threadReply(client, replyThread, `skipping — ${outcome.reason}.`);
+      else if (outcome.kind === "failed")
+        await threadReply(client, replyThread, `couldn't ${parsed.command} ${key}: ${outcome.error.slice(0, 200)}`);
+      else await threadReply(client, replyThread, `👀 ${parsed.command} done — see comments: ${outcome.url}`);
+    } finally {
+      inflight.release(key);
+    }
+    return;
+  }
+
+  if (parsed.command === "addressed") {
+    // Reuse the auto "addressed" path: verify findings are handled, then approve. The mention IS the
+    // signal (pass "addressed" as reply text); maybeApprove gates on ownership (hasReviewed/own-eyes).
+    const rootTs = threadTs ?? messageTs;
+    const rootText = (await messageText(client, rootTs)) || text;
+    await maybeApprove(client, rootTs, rootText, "", botUserId, messageTs, "addressed");
+    return;
+  }
+
+  if (parsed.command === "approve") {
+    await approveOnRequest(client, replyThread, owner, repo, number);
+    return;
   }
 }
