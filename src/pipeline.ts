@@ -169,23 +169,26 @@ export async function maybeApprove(
   if (!pr) return;
   if (replyUserId === botUserId) return; // the bot's own "see comments" reply is not a signal
 
-  // Parent must be a PR the bot reviewed (carries :eyes:).
-  if (!(await reactionNames(client, parentTs)).includes(config.claimEmoji)) return;
-
   // Only a reply that LEADS with an "addressed" signal counts — ignore ordinary thread chatter
   // (incl. messages that merely mention the word) so the bot never :eyes:/approves on discussion.
   if (!isAddressedSignal(replyText)) return;
 
-  // Acknowledge it with :eyes: on the reply itself so it's visible the bot caught the signal (even
-  // if it then holds, e.g. CI not green). Idempotent; swallow any error.
+  const { owner, repo, number } = pr;
+  const me = await gh.authUserLogin();
+
+  // Only engage on a PR OUR bot ACTUALLY reviewed. A bare :eyes: on the parent is NOT proof — humans
+  // and OTHER bots (e.g. Alden Assistant) claim with :eyes: too, which made the bot ack "addressed"
+  // on TMASA #137, a PR it never reviewed. The authoritative signal is a review by our GH identity.
+  if (!(await gh.hasReviewedBy(owner, repo, number, me))) return;
+
+  // Acknowledge the signal with :eyes: on the reply so it's visible the bot caught it (even if it
+  // then holds, e.g. CI not green). Idempotent; swallow any error.
   if (replyTs) {
     await client.reactions
       .add({ channel: config.slack.channelId, timestamp: replyTs, name: config.claimEmoji })
       .catch(() => undefined);
   }
 
-  const { owner, repo, number } = pr;
-  const me = await gh.authUserLogin();
   if (await gh.hasApprovedBy(owner, repo, number, me)) return; // already approved
 
   const meta = await gh.getPr(owner, repo, number);
