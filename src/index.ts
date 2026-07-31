@@ -1,7 +1,14 @@
 import pkg from "@slack/bolt";
 const { App } = pkg;
 import { config } from "./config.js";
-import { handleReviewRequest, maybeApprove, reconcileApprovals, handleCiComplete, handleMention } from "./pipeline.js";
+import {
+  handleReviewRequest,
+  maybeApprove,
+  reconcileApprovals,
+  reviewCatchup,
+  handleCiComplete,
+  handleMention,
+} from "./pipeline.js";
 import { startGithubWebhookServer } from "./webhook.js";
 import { mentionsBot } from "./mentions.js";
 
@@ -76,12 +83,26 @@ app.message(async ({ message, client }) => {
   // Self-heal sweep: every 2 min, pick up "addressed" replies the live event handler may have
   // missed (e.g. posted while the bot was restarting — Socket Mode doesn't replay) and approve.
   const RECONCILE_MS = 120_000;
-  const sweep = () =>
-    reconcileApprovals(app.client, me).catch((e) =>
-      console.error("[pr-review-bot] reconcile error:", e)
-    );
-  setInterval(sweep, RECONCILE_MS);
-  void sweep(); // run one now on boot to catch anything missed while down
+  // Each sweep: (1) catch-up REVIEW any un-claimed eligible PR (Socket Mode doesn't replay events
+  // missed while the computer was off, so a PR posted overnight would sit stale), then (2) reconcile
+  // APPROVALS for reviewed PRs whose author replied "addressed". The boot run below means every time
+  // the machine turns on, the bot re-scans the channel so nothing is left stale. Guarded so a slow
+  // catch-up (multiple reviews) never stacks with the next tick.
+  let sweeping = false;
+  const sweep = async () => {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      await reviewCatchup(app.client, me);
+      await reconcileApprovals(app.client, me);
+    } catch (e) {
+      console.error("[pr-review-bot] sweep error:", e);
+    } finally {
+      sweeping = false;
+    }
+  };
+  setInterval(() => void sweep(), RECONCILE_MS);
+  void sweep(); // run one now on boot — catch up on anything posted/addressed while down
 
   // Event-driven CI (optional): approve the instant GitHub reports CI green, instead of waiting for
   // the next poll. Only starts when GITHUB_WEBHOOK_SECRET is set; the poll above stays as fallback.

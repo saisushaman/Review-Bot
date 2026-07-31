@@ -422,6 +422,28 @@ export async function reconcileApprovals(client: WebClient, botUserId: string): 
 }
 
 /**
+ * Catch-up review sweep — review any eligible PR-request in recent channel history that isn't yet
+ * claimed (no :eyes:). Socket Mode does NOT replay events missed while the host was asleep/off, so a
+ * PR posted while the computer was off would otherwise never be seen and sit stale forever. Running
+ * this on boot (and each interval) guarantees nothing is left unreviewed. handleReviewRequest itself
+ * re-checks the :eyes: claim, so already-reviewed PRs are skipped fast (no re-review).
+ */
+export async function reviewCatchup(client: WebClient, botUserId: string): Promise<void> {
+  const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 30 });
+  // Oldest-first so PRs are picked up in the order they were posted.
+  for (const msg of (hist.messages ?? []).slice().reverse()) {
+    const m = msg as { ts?: string; text?: string };
+    if (!m.ts || !m.text) continue;
+    if (!parsePrUrl(m.text) || !tagsRequiredUser(m.text)) continue; // not an eligible review request
+    try {
+      await handleReviewRequest(client, m.ts, m.text, botUserId); // skips if already :eyes:-claimed
+    } catch (e) {
+      console.warn(`[pr-review-bot] catch-up review error on ${m.ts}:`, e);
+    }
+  }
+}
+
+/**
  * A GitHub CI webhook fired (check_suite/workflow_run/status completed). Immediately run the approve
  * check for the affected PR(s) — the instant, event-driven counterpart to the poll. maybeApprove
  * re-checks everything (CI green, no CHANGES_REQUESTED, fix verified), so a spurious or duplicate
