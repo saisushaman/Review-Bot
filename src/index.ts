@@ -6,6 +6,7 @@ import {
   maybeApprove,
   reconcileApprovals,
   reviewCatchup,
+  mentionCatchup,
   handleCiComplete,
   handleMention,
 } from "./pipeline.js";
@@ -93,7 +94,8 @@ app.message(async ({ message, client }) => {
     if (sweeping) return;
     sweeping = true;
     try {
-      await reviewCatchup(app.client, me);
+      await reviewCatchup(app.client, me); // top-level PR requests missed while down
+      await mentionCatchup(app.client, me); // @-mentions (incl. in threads) missed while down
       await reconcileApprovals(app.client, me);
     } catch (e) {
       console.error("[pr-review-bot] sweep error:", e);
@@ -103,6 +105,43 @@ app.message(async ({ message, client }) => {
   };
   setInterval(() => void sweep(), RECONCILE_MS);
   void sweep(); // run one now on boot — catch up on anything posted/addressed while down
+
+  // ── Watchdog ────────────────────────────────────────────────────────────────────────────────
+  // Exit (so the keepalive relaunches with a FRESH connection) if the Slack link is unhealthy too
+  // long. Catches BOTH a network/DNS outage (auth.test throws — e.g. ENOTFOUND slack.com) AND a
+  // socket that went deaf but never reconnected while the process stayed up (the #139 miss — Bolt
+  // reported disconnected/reconnecting yet the process lived on, deaf, until a manual restart).
+  const DEAF_LIMIT_MS = Number(process.env.DEAF_LIMIT_MS ?? 180_000); // 3 min
+  let socketDownSince: number | null = null;
+  try {
+    const sm = (app as unknown as { receiver?: { client?: { on?: (e: string, cb: () => void) => void } } })
+      .receiver?.client;
+    if (sm?.on) {
+      sm.on("connected", () => (socketDownSince = null));
+      sm.on("disconnected", () => (socketDownSince ??= Date.now()));
+      sm.on("reconnecting", () => (socketDownSince ??= Date.now()));
+    }
+  } catch {
+    /* Bolt internal shape changed — the API heartbeat below still guards the network case */
+  }
+  let apiDownSince: number | null = null;
+  setInterval(async () => {
+    try {
+      await app.client.auth.test();
+      apiDownSince = null;
+    } catch {
+      apiDownSince ??= Date.now();
+    }
+    const now = Date.now();
+    const socketDeaf = socketDownSince != null && now - socketDownSince > DEAF_LIMIT_MS;
+    const apiDeaf = apiDownSince != null && now - apiDownSince > DEAF_LIMIT_MS;
+    if (socketDeaf || apiDeaf) {
+      console.error(
+        `[pr-review-bot] watchdog: Slack connection unhealthy (socketDeaf=${socketDeaf} apiDeaf=${apiDeaf}) — exiting so the keepalive relaunches`
+      );
+      process.exit(1);
+    }
+  }, 60_000);
 
   // Event-driven CI (optional): approve the instant GitHub reports CI green, instead of waiting for
   // the next poll. Only starts when GITHUB_WEBHOOK_SECRET is set; the poll above stays as fallback.

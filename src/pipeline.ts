@@ -461,6 +461,40 @@ export async function reviewCatchup(client: WebClient, botUserId: string): Promi
 }
 
 /**
+ * Catch-up for @-MENTION commands missed while the socket was deaf/down — the #139 case. Socket Mode
+ * doesn't replay events, so a `@Review Window review` posted while the bot was disconnected is lost.
+ * Scans recent messages AND their thread replies for a mention of the bot that it hasn't acted on
+ * (no bot :eyes: on the mention — handleMention acks with :eyes:) and re-dispatches the review/
+ * approve/addressed commands. status/help are instant no-ops, so they're skipped (no re-flooding).
+ */
+export async function mentionCatchup(client: WebClient, botUserId: string): Promise<void> {
+  type Msg = { ts?: string; text?: string; user?: string; reply_count?: number; reactions?: Array<{ name: string; users?: string[] }> };
+  const botEyed = (m: Msg) =>
+    (m.reactions ?? []).some((r) => r.name === config.claimEmoji && (r.users ?? []).includes(botUserId));
+  const consider = async (m: Msg, threadTs: string | undefined) => {
+    if (!m.ts || !m.text || m.user === botUserId) return;
+    if (!mentions.mentionsBot(m.text, botUserId)) return; // not addressed to the bot
+    if (botEyed(m)) return; // already handled (handleMention acked it with :eyes:)
+    const cmd = mentions.parseMention(m.text).command;
+    if (cmd !== "review" && cmd !== "re-review" && cmd !== "addressed" && cmd !== "approve") return;
+    try {
+      await handleMention(client, m.ts, threadTs, m.text, botUserId);
+    } catch (e) {
+      console.warn(`[pr-review-bot] mention catch-up error on ${m.ts}:`, e);
+    }
+  };
+  const hist = await client.conversations.history({ channel: config.slack.channelId, limit: 20 });
+  for (const msg of (hist.messages ?? []).slice().reverse()) {
+    const m = msg as Msg;
+    await consider(m, undefined); // a top-level mention of the bot (PR resolved from its text)
+    if ((m.reply_count ?? 0) > 0 && m.ts) {
+      const th = await client.conversations.replies({ channel: config.slack.channelId, ts: m.ts, limit: 50 });
+      for (const r of (th.messages ?? []).slice(1)) await consider(r as Msg, m.ts); // thread mentions
+    }
+  }
+}
+
+/**
  * A GitHub CI webhook fired (check_suite/workflow_run/status completed). Immediately run the approve
  * check for the affected PR(s) — the instant, event-driven counterpart to the poll. maybeApprove
  * re-checks everything (CI green, no CHANGES_REQUESTED, fix verified), so a spurious or duplicate
