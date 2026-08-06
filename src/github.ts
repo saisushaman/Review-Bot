@@ -212,6 +212,49 @@ export function isCodeFile(f: string): boolean {
   return !/\.(md|mdx|txt|rst)$/i.test(f) && !/(^|\/)docs\//i.test(f) && !/ledger|changelog/i.test(f);
 }
 
+const LOCKFILE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|poetry\.lock|composer\.lock|go\.sum)$/i;
+
+/**
+ * Full content of the PR's changed CODE files at `ref` (the head), for review CONTEXT — so the model
+ * reviews the change against the actual surrounding code (functions, call sites, types, invariants),
+ * not just the +/- diff lines. Skips removed/binary/lock files. Capped per-file and in total to keep
+ * the prompt bounded; `truncated` marks a file that hit the per-file cap.
+ */
+export async function changedFilesContent(
+  owner: string,
+  repo: string,
+  number: number,
+  ref: string,
+  perFileBytes = 28_000,
+  totalBytes = 450_000
+): Promise<Array<{ path: string; content: string; truncated: boolean }>> {
+  const files = await octokit.paginate(octokit.pulls.listFiles, {
+    owner,
+    repo,
+    pull_number: number,
+    per_page: 100,
+  });
+  const out: Array<{ path: string; content: string; truncated: boolean }> = [];
+  let used = 0;
+  for (const f of files) {
+    if (used >= totalBytes) break;
+    if (f.status === "removed" || !isCodeFile(f.filename) || LOCKFILE.test(f.filename)) continue;
+    try {
+      const { data } = await octokit.repos.getContent({ owner, repo, path: f.filename, ref });
+      if (Array.isArray(data) || data.type !== "file" || typeof data.content !== "string") continue;
+      const full = Buffer.from(data.content, "base64").toString("utf8");
+      if (full.includes(String.fromCharCode(0))) continue; // skip binary (NUL byte)
+      const cap = Math.min(perFileBytes, totalBytes - used);
+      const content = full.slice(0, cap);
+      out.push({ path: f.filename, content, truncated: content.length < full.length });
+      used += content.length;
+    } catch {
+      /* unreadable file — skip, the diff still covers it */
+    }
+  }
+  return out;
+}
+
 /** Extract a ticket key like "PORTAL-69" / "PLANE-26" from a PR title or branch, or null. */
 export function ticketKey(title: string, headRef: string): string | null {
   const m = `${title} ${headRef}`.match(/\b([A-Z][A-Z0-9]{1,9}-\d+)\b/);

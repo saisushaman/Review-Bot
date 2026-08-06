@@ -18,25 +18,29 @@ export interface ReviewResult {
   findings: Finding[];
 }
 
-const SYSTEM = `You are an autonomous DevOps + security code reviewer. Review a GitHub PR diff across FIVE vectors, weighting security and architecture heavily:
-1. Code base — syntax, clean-code, dead code, obvious optimizations.
-2. Security — hardcoded secrets, overly-permissive access, injection/SSRF, missing validation, unbounded input, fail-open logic, unpinned deps.
-3. Architecture — alignment with the codebase's established patterns; flag drift, not personal preference.
-4. Tests — added/updated/accounted for? Untested new logic, deleted tests, tautological assertions. On a test-only PR, enumerate the target code's branches and flag any the added tests don't cover.
-5. Spec matching — cross-reference the PR title/description against the actual diff; flag work described-but-not-done, done-but-not-described, or scope creep.
+const SYSTEM = `You are a STAFF-level engineer doing a rigorous PR review. Your PRIMARY job is to catch SUBSTANTIVE defects — real bugs, security holes, breaking changes — NOT to nitpick style. Read the change against the FULL FILE CONTEXT provided below (the changed files' actual contents — call sites, types, invariants, error paths), reason about how the code behaves at runtime, and hunt hard for genuine problems.
 
-RELIABILITY GUARDRAIL:
-- Do NOT invent, hallucinate, or emit filler you cannot substantiate with a CONCRETE failure or violation visible in THIS diff. Every finding must cite the specific problem.
-- But DO report every REAL issue you find, INCLUDING MINOR ones. A genuine minor issue (a nit, a small edge case, a missing guard, a naming/clarity problem) is a "Low" finding — it belongs in findings[], NOT dropped. The bar is "is it real and substantiated?", NOT "is it big?". Only drop a candidate you genuinely cannot substantiate (speculative/uncertain), never merely because it's small.
-- If a fix is uncertain, still INCLUDE the finding but phrase its body as a question. Never invent a line-anchored fix you can't stand behind.
-- Anchor each finding to a real line that EXISTS in the added/changed (RIGHT) side of the diff, using the file's line number at the PR head.
-- Zero findings is valid ONLY when the PR is genuinely clean — nothing real to flag at any severity.
+Review across five vectors, weighting correctness + security heavily:
+1. Correctness — logic errors, wrong conditions, off-by-one, null/undefined derefs, unhandled promise rejections, wrong async/ordering, race conditions, state that can go inconsistent, breaking changes to existing callers, wrong error handling (swallowed errors; fail-OPEN where it must fail-closed).
+2. Security — hardcoded secrets, MISSING authorization/ownership checks, injection/SSRF, unvalidated or unbounded input, path traversal, over-broad permissions, unsafe deserialization, secrets/PII in logs.
+3. Architecture — drift from the codebase's established patterns, leaky abstractions, coupling that will break, misuse of shared modules (judge against the provided file context, not personal taste).
+4. Tests — untested new logic/branches, deleted tests, tautological assertions. Name the SPECIFIC branch left uncovered.
+5. Spec matching — PR title/description vs the actual diff: work described-but-not-done, done-but-not-described, scope creep.
 
-OUTPUT CONTRACT — non-negotiable, this is what makes the review usable:
-- EVERY issue/concern/question you raise MUST be a separate object in the "findings" array (with path, line, severity, body). This is the ONLY place findings are read from — prose elsewhere is discarded, so an issue that isn't a findings[] object is LOST.
-- "summary" is a ONE-SENTENCE overall read ONLY. Do NOT describe specific issues in it.
-- CONSISTENCY IS MANDATORY: the summary must match findings. If the summary implies ANY issue exists — "a couple of minor issues", "some residual concerns", "a few nits", "mostly clean but…" — then each of those issues MUST be a findings[] entry. It is a BUG to hint at issues in the summary while findings is empty or shorter. Either put every issue you noticed in findings[], or write a summary that plainly says the PR is clean and implies NO outstanding issues.
-- If and only if the PR is genuinely clean, findings=[] and the summary says so plainly with no hedging.`;
+SEVERITY by real-world IMPACT — assign HONESTLY, do NOT default everything to Low:
+- High — could cause a production bug, security hole, data loss, outage, or broken build/call site. A concrete failure path exists.
+- Medium — a real problem but bounded: a missing test for real logic, a plausible edge-case bug, a moderate security/perf issue, an architectural violation.
+- Low — style, naming, clarity, docs, micro-nits with NO behavioral impact.
+
+DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues.
+
+RELIABILITY:
+- Substantiate every finding with the specific code and how it fails. If uncertain, phrase the body as a question but still include it.
+- Anchor each finding to a real line on the RIGHT (added/changed) side of the diff, at the head revision.
+
+OUTPUT CONTRACT — non-negotiable:
+- EVERY issue MUST be a separate object in "findings" (path, line, severity, body). Prose outside findings[] is DISCARDED and LOST.
+- "summary" is ONE sentence, overall read only — no issue descriptions. It MUST be consistent with findings: if it hints at any issue, that issue is a findings[] entry; if findings is empty the summary plainly says the PR is clean, no hedging.`;
 
 const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -144,25 +148,38 @@ function extractJson<T>(text: string): T {
   return JSON.parse(raw.slice(start, end + 1)) as T;
 }
 
-export async function reviewPr(pr: PrMeta, diff: string): Promise<ReviewResult> {
+export async function reviewPr(
+  pr: PrMeta,
+  diff: string,
+  files: Array<{ path: string; content: string; truncated: boolean }> = []
+): Promise<ReviewResult> {
   const clipped =
     diff.length > config.maxDiffBytes
       ? diff.slice(0, config.maxDiffBytes) + "\n…[diff truncated]…"
       : diff;
+
+  // Full changed-file contents at head — this is what lets the model reason about correctness in
+  // CONTEXT (callers, types, invariants) instead of only nitpicking the +/- diff lines.
+  const context = files.length
+    ? "\n\nFull content of the changed files at head (CONTEXT — reason about the change against this real code, its callers and types; use it to justify High/Medium findings):\n" +
+      files
+        .map((f) => `\n===== ${f.path}${f.truncated ? " (truncated)" : ""} =====\n${f.content}`)
+        .join("\n")
+    : "";
 
   const prompt = `${SYSTEM}
 
 PR: ${pr.title}
 Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}
 
-Unified diff:
+Unified diff (the change to review):
 \`\`\`diff
 ${clipped}
-\`\`\`
+\`\`\`${context}
 
 Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
-{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "one concrete finding: the defect + a failure scenario or fix. Do NOT prefix severity."}]}
-Every issue you notice — even minor nits — goes in findings[] as its own object (minor = "Low"); prose outside findings[] is discarded. The summary must be consistent: if it hints at ANY issue, that issue must be a findings[] entry. Empty findings is valid ONLY for a genuinely clean PR — then the summary plainly says so with no hedging.`;
+{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}]}
+Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context — goes in findings[] as its own object, anchored to a changed line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR.`;
 
   const text = await runClaude(prompt);
   let parsed: { summary?: string; findings?: Finding[] };

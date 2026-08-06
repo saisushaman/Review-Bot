@@ -106,7 +106,12 @@ async function produceReview(owner: string, repo: string, number: number): Promi
 
   try {
     const diff = await gh.getPrDiff(owner, repo, number);
-    const result = await reviewPr(meta, diff);
+    // Fetch the changed files' full contents so the review reasons in CONTEXT (callers/types), not
+    // just the diff — the fix for "only low-priority nits". Falls back to diff-only if it fails.
+    const files = await gh
+      .changedFilesContent(owner, repo, number, meta.headOid)
+      .catch(() => [] as Array<{ path: string; content: string; truncated: boolean }>);
+    const result = await reviewPr(meta, diff, files);
 
     // Split findings into those that anchor to a real diff line (posted inline) and those that
     // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
