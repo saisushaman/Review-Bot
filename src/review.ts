@@ -52,10 +52,20 @@ const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * is_error/result), NOT stderr — so we surface stdout in the error, else failures look empty
  * (which is exactly why the 2026-07-28 drops logged `exited 1:` with nothing after).
  */
-function spawnClaudeOnce(prompt: string, timeoutMs: number, model?: string): Promise<string> {
+export interface ClaudeOpts {
+  model?: string; // optional cheaper model (e.g. the verify pass)
+  cwd?: string; // run claude IN this dir (a repo checkout) so it can read the codebase
+  repoTools?: boolean; // allow read-only file tools (Read/Grep/Glob) for whole-repo review
+}
+
+function spawnClaudeOnce(prompt: string, timeoutMs: number, opts: ClaudeOpts = {}): Promise<string> {
   return new Promise((resolve, reject) => {
     const args = ["-p", "--output-format", "json"];
-    if (model) args.push("--model", model); // optional cheaper model (e.g. verify pass)
+    if (opts.model) args.push("--model", opts.model);
+    // Whole-repo review: let claude explore the checkout with READ-ONLY tools, no permission prompt
+    // (which would hang headless). Restricted to Read/Grep/Glob — the review never writes or runs code.
+    if (opts.repoTools)
+      args.push("--permission-mode", "bypassPermissions", "--allowedTools", "Read", "Grep", "Glob");
     // Force SUBSCRIPTION auth: if ANTHROPIC_API_KEY is present in the env, `claude -p` bills the
     // metered API instead of the Claude subscription — and a stale/empty-credit key then makes every
     // review fail with "Credit balance is too low" (hit live 2026-07-30). This bot is designed to run
@@ -65,6 +75,7 @@ function spawnClaudeOnce(prompt: string, timeoutMs: number, model?: string): Pro
     const child = spawn("claude", args, {
       shell: process.platform === "win32", // resolve claude.cmd on Windows
       env,
+      cwd: opts.cwd,
     });
     let out = "";
     let err = "";
@@ -115,13 +126,13 @@ async function runClaude(
   prompt: string,
   timeoutMs = 180_000,
   attempts = 3,
-  model?: string
+  opts: ClaudeOpts = {}
 ): Promise<string> {
   const backoffMs = [5_000, 15_000, 30_000];
   let lastErr: unknown;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      return await spawnClaudeOnce(prompt, timeoutMs, model);
+      return await spawnClaudeOnce(prompt, timeoutMs, opts);
     } catch (e) {
       lastErr = e;
       if (attempt < attempts - 1) {
@@ -181,9 +192,13 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of this exa
 {"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}]}
 Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context — goes in findings[] as its own object, anchored to a changed line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR.`;
 
-  // Generous timeout: the full-file context makes a deep review take longer than the 180s default
-  // (it timed out on the first attempt during testing). 6 min leaves ample room even for big PRs.
-  const text = await runClaude(prompt, 360_000);
+  // Generous timeout: the full-file context makes a deep review take longer than the 180s default.
+  return parseReviewResult(await runClaude(prompt, 360_000));
+}
+
+/** Parse claude's JSON review output into findings. Coerces `line` (models emit "138" / 138.0) and
+ *  drops any finding missing a valid positive-integer line or a required field (PR #31 fix). */
+function parseReviewResult(text: string): ReviewResult {
   let parsed: { summary?: string; findings?: Finding[] };
   try {
     parsed = extractJson<{ summary?: string; findings?: Finding[] }>(text);
@@ -192,16 +207,44 @@ Assign severity by REAL IMPACT (don't default to Low). Every issue — including
   }
   return {
     summary: parsed.summary ?? "",
-    // Coerce `line` before validating: models frequently emit it as a string ("138") or float
-    // (138.0). The old `Number.isInteger(f.line)` check dropped every such finding SILENTLY, so a
-    // review would claim findings in its summary but post zero inline comments (PR #31). Now we
-    // parse it and keep any finding with a real positive integer line + the required fields.
     findings: (parsed.findings ?? [])
       .map((f) => ({ ...f, line: Math.trunc(Number((f as { line?: unknown }).line)) }))
-      .filter(
-        (f) => f && f.path && Number.isInteger(f.line) && f.line > 0 && f.severity && f.body
-      ),
+      .filter((f) => f && f.path && Number.isInteger(f.line) && f.line > 0 && f.severity && f.body),
   };
+}
+
+/**
+ * WHOLE-REPO review: run `claude -p` INSIDE the PR's checkout (repoDir) with read-only file tools,
+ * so it can Read/Grep/Glob across the ENTIRE codebase to reason about the change in full context —
+ * callers, types, cross-file effects, tests. The deepest review. Same output contract + parser.
+ */
+export async function reviewPrWithRepo(
+  pr: PrMeta,
+  diff: string,
+  repoDir: string
+): Promise<ReviewResult> {
+  const clipped =
+    diff.length > config.maxDiffBytes
+      ? diff.slice(0, config.maxDiffBytes) + "\n…[diff truncated]…"
+      : diff;
+  const prompt = `${SYSTEM}
+
+You are running INSIDE a checkout of this repository at the PR's head commit (${pr.headOid}). Use the Read, Grep, and Glob tools to open ANY files you need — the changed files, their callers, the types/interfaces they use, related modules and tests — to review the change in full context. Do not guess about code you can open and read.
+
+PR: ${pr.title}
+Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}
+
+The change under review (unified diff):
+\`\`\`diff
+${clipped}
+\`\`\`
+
+After exploring the repo as needed, respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
+{"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}]}
+Anchor every finding to a line on the RIGHT (added/changed) side of the diff. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR.`;
+
+  // 10-min timeout — exploring a repo is slower than a text-only pass. Read-only tools only.
+  return parseReviewResult(await runClaude(prompt, 600_000, 3, { cwd: repoDir, repoTools: true }));
 }
 
 export interface VerifyResult {
@@ -239,7 +282,7 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of exactly 
 {"verdicts": [{"i": <finding index int>, "addressed": true|false, "why": "<=12 words"}]}`;
   try {
     // Verify runs on config.verifyModel when set (e.g. Haiku) — cheaper/faster than the review pass.
-    const text = await runClaude(prompt, 150_000, 3, config.verifyModel || undefined);
+    const text = await runClaude(prompt, 150_000, 3, { model: config.verifyModel || undefined });
     const parsed = extractJson<{ verdicts?: Array<{ i?: number; addressed?: boolean; why?: string }> }>(
       text
     );

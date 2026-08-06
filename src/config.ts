@@ -72,6 +72,11 @@ export const config = {
     "REVIEW_STATE_PATH",
     path.join(os.homedir(), ".pr-review-bot", "review-state.json")
   ),
+  // Whole-repo review: clone the repo (blobless) at the PR head and run `claude -p` INSIDE it so it
+  // can read any file across the codebase (deepest context). Default ON; falls back to the diff +
+  // fetched-file-content review if the clone fails. Clones cache under repoCacheRoot.
+  repoContextReview: bool("REPO_CONTEXT_REVIEW", true),
+  repoCacheRoot: opt("REPO_CACHE_ROOT", path.join(os.homedir(), ".pr-review-bot", "repo-cache")),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */

@@ -1,7 +1,8 @@
 import type { WebClient } from "@slack/web-api";
 import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
-import { reviewPr, verifyFix, type Severity } from "./review.js";
+import { reviewPr, reviewPrWithRepo, verifyFix, type Severity } from "./review.js";
+import { prepareRepoCheckout } from "./repoClone.js";
 import type { CiEvent } from "./webhook.js";
 import * as reviewState from "./reviewState.js";
 import * as inflight from "./inflight.js";
@@ -106,12 +107,23 @@ async function produceReview(owner: string, repo: string, number: number): Promi
 
   try {
     const diff = await gh.getPrDiff(owner, repo, number);
-    // Fetch the changed files' full contents so the review reasons in CONTEXT (callers/types), not
-    // just the diff — the fix for "only low-priority nits". Falls back to diff-only if it fails.
-    const files = await gh
-      .changedFilesContent(owner, repo, number, meta.headOid)
-      .catch(() => [] as Array<{ path: string; content: string; truncated: boolean }>);
-    const result = await reviewPr(meta, diff, files);
+    // Deepest review: clone the repo at the PR head and let claude read the WHOLE codebase (callers,
+    // types, cross-file effects). Falls back to the diff + fetched-file-content review if the clone
+    // fails or the feature is off — repo context is a bonus, never a hard dependency.
+    let result: Awaited<ReturnType<typeof reviewPr>>;
+    const checkout = config.repoContextReview ? await prepareRepoCheckout(owner, repo, number) : null;
+    if (checkout) {
+      try {
+        result = await reviewPrWithRepo(meta, diff, checkout.dir);
+      } finally {
+        await checkout.cleanup();
+      }
+    } else {
+      const files = await gh
+        .changedFilesContent(owner, repo, number, meta.headOid)
+        .catch(() => [] as Array<{ path: string; content: string; truncated: boolean }>);
+      result = await reviewPr(meta, diff, files);
+    }
 
     // Split findings into those that anchor to a real diff line (posted inline) and those that
     // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
