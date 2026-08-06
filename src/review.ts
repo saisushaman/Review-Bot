@@ -181,7 +181,9 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of this exa
 {"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}]}
 Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context — goes in findings[] as its own object, anchored to a changed line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR.`;
 
-  const text = await runClaude(prompt);
+  // Generous timeout: the full-file context makes a deep review take longer than the 180s default
+  // (it timed out on the first attempt during testing). 6 min leaves ample room even for big PRs.
+  const text = await runClaude(prompt, 360_000);
   let parsed: { summary?: string; findings?: Finding[] };
   try {
     parsed = extractJson<{ summary?: string; findings?: Finding[] }>(text);
