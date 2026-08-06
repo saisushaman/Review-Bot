@@ -5,6 +5,7 @@ const octokit = new Octokit({ auth: config.github.token });
 
 export interface PrMeta {
   title: string;
+  body: string; // the PR description — the author's stated intent (for spec-matching)
   authorLogin: string;
   state: string; // "open" | "closed"
   merged: boolean; // true once the PR has been merged
@@ -36,6 +37,7 @@ export async function getPr(owner: string, repo: string, number: number): Promis
   const { data } = await octokit.pulls.get({ owner, repo, pull_number: number });
   return {
     title: data.title,
+    body: data.body ?? "",
     authorLogin: data.user?.login ?? "",
     state: data.state,
     merged: data.merged ?? false,

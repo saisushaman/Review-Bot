@@ -159,10 +159,33 @@ function extractJson<T>(text: string): T {
   return JSON.parse(raw.slice(start, end + 1)) as T;
 }
 
+export interface PriorComment {
+  path: string;
+  line: number;
+  body: string;
+}
+
+/** Shared review context: the PR's stated intent (for spec-matching) and the comments OTHER
+ *  reviewers already left (so the bot doesn't re-state them — it focuses on what they missed). */
+function prContextBlock(pr: PrMeta, priorComments: PriorComment[]): string {
+  const body = pr.body.trim()
+    ? `\n\nPR description — the author's STATED INTENT; judge the change against it (spec-matching), and flag anything described-but-not-done, done-but-not-described, or scope creep:\n${pr.body.slice(0, 4000)}`
+    : "";
+  const prior = priorComments.length
+    ? `\n\nOther reviewers ALREADY left these comments — do NOT repeat them. Only report real issues they MISSED (if they covered everything and the PR is otherwise clean, return 0 findings):\n` +
+      priorComments
+        .slice(0, 40)
+        .map((c) => `- ${c.path}:${c.line} — ${c.body.replace(/\s+/g, " ").slice(0, 160)}`)
+        .join("\n")
+    : "";
+  return body + prior;
+}
+
 export async function reviewPr(
   pr: PrMeta,
   diff: string,
-  files: Array<{ path: string; content: string; truncated: boolean }> = []
+  files: Array<{ path: string; content: string; truncated: boolean }> = [],
+  priorComments: PriorComment[] = []
 ): Promise<ReviewResult> {
   const clipped =
     diff.length > config.maxDiffBytes
@@ -181,7 +204,7 @@ export async function reviewPr(
   const prompt = `${SYSTEM}
 
 PR: ${pr.title}
-Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}
+Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}
 
 Unified diff (the change to review):
 \`\`\`diff
@@ -221,7 +244,8 @@ function parseReviewResult(text: string): ReviewResult {
 export async function reviewPrWithRepo(
   pr: PrMeta,
   diff: string,
-  repoDir: string
+  repoDir: string,
+  priorComments: PriorComment[] = []
 ): Promise<ReviewResult> {
   const clipped =
     diff.length > config.maxDiffBytes
@@ -232,7 +256,7 @@ export async function reviewPrWithRepo(
 You are running INSIDE a checkout of this repository at the PR's head commit (${pr.headOid}). Use the Read, Grep, and Glob tools to open ANY files you need — the changed files, their callers, the types/interfaces they use, related modules and tests — to review the change in full context. Do not guess about code you can open and read.
 
 PR: ${pr.title}
-Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}
+Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}
 
 The change under review (unified diff):
 \`\`\`diff
