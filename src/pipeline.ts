@@ -206,10 +206,29 @@ async function finalizeReview(
     .catch(() => undefined);
 }
 
+/** :eyes: status on a message: is any present, and is one OURS (for stuck-claim recovery). */
+async function eyesInfo(
+  client: WebClient,
+  ts: string,
+  botUserId: string
+): Promise<{ present: boolean; weOwn: boolean }> {
+  const res = await client.reactions.get({ channel: config.slack.channelId, timestamp: ts });
+  const eyes = (
+    (res.message as { reactions?: Array<{ name: string; users?: string[] }> } | undefined)?.reactions ?? []
+  ).find((r) => r.name === config.claimEmoji);
+  return { present: !!eyes, weOwn: !!eyes && (eyes.users ?? []).includes(botUserId) };
+}
+
 /**
- * A new PR-review request landed in the channel. Eligibility = PR URL + tags the
- * required user + no :eyes:. Debounce, claim, review, post, reply. Leaves :eyes:
- * only — approval is a separate step (see maybeApprove).
+ * A PR-review request (PR URL + tags the required user). Ownership is the DURABLE record, not just
+ * the :eyes: reaction:
+ *   • already in our review record → done, skip.
+ *   • another account's :eyes: (human / other bot) → yield, skip.
+ *   • OUR :eyes: but NOT recorded → a STUCK claim (e.g. a review interrupted by a restart/crash) →
+ *     recover it: review without re-claiming.
+ *   • no :eyes: → debounce + claim + review.
+ * The whole review is inflight-guarded so a concurrent sweep never double-reviews a mid-flight PR.
+ * Leaves :eyes: on after posting; approval is a separate step (see maybeApprove / finalizeReview).
  */
 export async function handleReviewRequest(
   client: WebClient,
@@ -219,38 +238,46 @@ export async function handleReviewRequest(
 ): Promise<void> {
   const pr = parsePrUrl(text);
   if (!pr || !tagsRequiredUser(text)) return; // not an eligible request
-
-  // Step 2 — already handled?
-  if ((await reactionNames(client, ts)).includes(config.claimEmoji)) return;
-
-  // Step 3 — debounce, then re-check, then claim.
-  await sleep(config.claimDebounceMs);
-  if ((await reactionNames(client, ts)).includes(config.claimEmoji)) return; // a human/other runner took it
-  await client.reactions.add({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji });
-
   const { owner, repo, number } = pr;
-  const outcome = await produceReview(owner, repo, number);
-  if (outcome.kind === "skipped") {
-    // Leave :eyes: on so a settled/own/not-allowed PR isn't re-picked; just note why.
-    await threadReply(client, ts, `Skipping — ${outcome.reason}.`);
-    return;
+  const key = reviewState.prKey(owner, repo, number);
+
+  if (reviewState.hasReviewed(key)) return; // durable record: already reviewed
+  const eyes = await eyesInfo(client, ts, botUserId);
+  if (eyes.present && !eyes.weOwn) return; // a human / other bot claimed it — yield
+  if (!eyes.present) {
+    // Unclaimed → debounce (yield to a human reacting in the window), re-check, then claim.
+    await sleep(config.claimDebounceMs);
+    if ((await eyesInfo(client, ts, botUserId)).present) return; // claimed during the debounce
+    await client.reactions.add({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji });
   }
-  if (outcome.kind === "failed") {
-    // Don't leave the PR silently claimed-but-unreviewed after a transient failure (that's how the
-    // 2026-07-28 drops got stuck) — release :eyes: so a re-post/re-tag re-triggers it.
-    await client.reactions
-      .remove({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji })
-      .catch(() => undefined);
-    await threadReply(
-      client,
-      ts,
-      `⚠️ Automated review failed after retries — unclaimed so it can be retried. Re-post or re-tag to trigger again. (${outcome.error.slice(0, 200)})`
-    ).catch(() => undefined);
-    console.warn(`[pr-review-bot] review failed for ${owner}/${repo}#${number}: ${outcome.error}`);
-    return;
+  // We own the claim now — fresh, or a recovered stuck one. Guard so a concurrent sweep that sees the
+  // same un-recorded :eyes: doesn't double-review while this pass runs.
+  if (!inflight.claim(key, "review")) return;
+  try {
+    const outcome = await produceReview(owner, repo, number);
+    if (outcome.kind === "skipped") {
+      await threadReply(client, ts, `Skipping — ${outcome.reason}.`); // leave :eyes: so it isn't re-picked
+      return;
+    }
+    if (outcome.kind === "failed") {
+      // Don't leave it silently claimed-but-unreviewed after a transient failure — release :eyes: so
+      // a re-post/re-tag (or the catch-up) re-triggers it.
+      await client.reactions
+        .remove({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji })
+        .catch(() => undefined);
+      await threadReply(
+        client,
+        ts,
+        `⚠️ Automated review failed after retries — unclaimed so it can be retried. Re-post or re-tag to trigger again. (${outcome.error.slice(0, 200)})`
+      ).catch(() => undefined);
+      console.warn(`[pr-review-bot] review failed for ${owner}/${repo}#${number}: ${outcome.error}`);
+      return;
+    }
+    // Comments → "see comments" (wait for author). Clean → approve + ✅ (gated). See finalizeReview.
+    await finalizeReview(client, ts, ts, owner, repo, number, outcome.url, outcome.findings);
+  } finally {
+    inflight.release(key);
   }
-  // Comments → "see comments" (wait for author). Clean → approve + ✅ (gated). See finalizeReview.
-  await finalizeReview(client, ts, ts, owner, repo, number, outcome.url, outcome.findings);
 }
 
 /**
