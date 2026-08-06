@@ -33,11 +33,11 @@ THREAT-MODEL & CLAIM-CHECK MANDATE — run this on ANY change touching auth, acc
 - Explicitly consider field forgery, impersonation (e.g. a forged userId), status/state tampering, and privilege escalation — not just "is there a check somewhere."
 
 SEVERITY by real-world IMPACT — assign HONESTLY, do NOT default everything to Low:
-- High — could cause a production bug, security hole, data loss, outage, or broken build/call site. A concrete failure path exists.
-- Medium — a real problem but bounded: a missing test for real logic, a plausible edge-case bug, a moderate security/perf issue, an architectural violation.
+- High — could cause a production bug, security hole, data loss, outage, or broken build/call site. INCLUDES any auth/permission BYPASS, field forgery, impersonation, privilege escalation, or tenant-isolation break (a client reading/writing data it shouldn't) — these are High even when the "happy path" is correct, because the exploit path is concrete.
+- Medium — a real problem but bounded: a missing test for real logic, a plausible edge-case bug, a moderate security/perf issue, an architectural violation, a dropped error state.
 - Low — style, naming, clarity, docs, micro-nits with NO behavioral impact.
 
-DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues.
+DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. Report EVERY substantive issue you find, not just the single most notable one — enumerate them all (correctness, error-handling, tests, and security). But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues.
 
 RELIABILITY:
 - Substantiate every finding with the specific code and how it fails. If uncertain, phrase the body as a question but still include it.
