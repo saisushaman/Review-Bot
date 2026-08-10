@@ -11,6 +11,14 @@ import * as mentions from "./mentions.js";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
 
+// A PR is routed to the DEEP whole-repo review (vs. the fast text path) whenever its diff touches
+// something security-sensitive, where cross-layer / rules / auth reasoning across the whole codebase
+// is exactly what catches the bugs (the Firestore/storage-rules bypass class the bot has missed).
+// Matched against the raw unified diff, so it fires on both file PATHS (+++ b/…) and telltale code.
+// Deliberately broad — a false "deep" only costs time; a false "fast" could miss an auth bug.
+const SENSITIVE_RE =
+  /\.rules\b|firestore\.rules|storage\.rules|firestore\.indexes|\brules_version\b|\ballow\s+(read|write|create|update|delete)\b|security[-_]?rules|\bIAM\b|\.iam\b|request\.auth|auth[-_]?(guard|middleware|check)|authoriz|permission|\brole[s]?\b|\brbac\b|\bacl\b|middleware|\.env\b|secret|credential|token|password|\bjwt\b|session|login|oauth|cors\b|csrf|sanitiz|upload|content[-_]?type|dockerfile|\.ya?ml$|webhook/i;
+
 // Cache of completed fix-verification verdicts, keyed by PR head SHA + review-comment signature.
 // The verify step spawns a headless `claude -p` — the single most expensive thing the bot does.
 // A held PR (CI green, not blocked, but not all findings addressed yet) is re-checked by the 2-min
@@ -114,14 +122,34 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     // types, cross-file effects). Falls back to the diff + fetched-file-content review if the clone
     // fails or the feature is off — repo context is a bonus, never a hard dependency.
     let result: Awaited<ReturnType<typeof reviewPr>>;
-    const checkout = config.repoContextReview ? await prepareRepoCheckout(owner, repo, number) : null;
+    // EFFICIENCY ROUTING (see config.deepReviewMax*): the whole-repo path is deep but expensive
+    // (clone + agentic crawl + 10-min budget). Only spend it where it pays off — a security-sensitive
+    // change (where cross-layer/rules reasoning is the whole point) or a large one. A small,
+    // non-sensitive PR takes the fast text path: its changed-file contents already give full context
+    // (callers, types, invariants within the touched files), no clone needed.
+    const changedLines = meta.additions + meta.deletions;
+    const sensitive = SENSITIVE_RE.test(diff);
+    const wantDeep =
+      config.repoContextReview &&
+      (sensitive ||
+        changedLines > config.deepReviewMaxLines ||
+        meta.changedFiles > config.deepReviewMaxFiles);
+    const checkout = wantDeep ? await prepareRepoCheckout(owner, repo, number) : null;
     if (checkout) {
+      console.log(
+        `[pr-review-bot] #${number}: DEEP review (whole-repo) — ${
+          sensitive ? "security-sensitive" : `${changedLines} lines / ${meta.changedFiles} files`
+        }`
+      );
       try {
         result = await reviewPrWithRepo(meta, diff, checkout.dir, priorComments);
       } finally {
         await checkout.cleanup();
       }
     } else {
+      console.log(
+        `[pr-review-bot] #${number}: FAST review (diff+files) — ${changedLines} lines / ${meta.changedFiles} files, not sensitive`
+      );
       const files = await gh
         .changedFilesContent(owner, repo, number, meta.headOid)
         .catch(() => [] as Array<{ path: string; content: string; truncated: boolean }>);

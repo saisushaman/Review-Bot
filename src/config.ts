@@ -77,6 +77,15 @@ export const config = {
   // fetched-file-content review if the clone fails. Clones cache under repoCacheRoot.
   repoContextReview: bool("REPO_CONTEXT_REVIEW", true),
   repoCacheRoot: opt("REPO_CACHE_ROOT", path.join(os.homedir(), ".pr-review-bot", "repo-cache")),
+  // EFFICIENCY ROUTING: the whole-repo path (clone + agentic crawl, 10-min budget) is the deep but
+  // expensive review. It's overkill for a small, non-sensitive change whose changed-file contents
+  // already give full context. So we only pay for it when it earns its keep — a PR is routed DEEP
+  // when it is security-sensitive (touches rules/auth/IAM/etc. — see SENSITIVE_RE in pipeline.ts) OR
+  // large (over the line/file thresholds below). Everything else takes the fast text path (diff +
+  // full changed-file contents, no clone). Set both thresholds to 0 to force every PR deep (old
+  // behavior); requires repoContextReview=true for any deep review at all.
+  deepReviewMaxLines: Number(opt("DEEP_REVIEW_MAX_LINES", "250")),
+  deepReviewMaxFiles: Number(opt("DEEP_REVIEW_MAX_FILES", "8")),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */
