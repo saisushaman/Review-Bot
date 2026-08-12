@@ -47,11 +47,13 @@ SEVERITY by real-world IMPACT — assign HONESTLY, do NOT default everything to 
 - Medium — a real problem but bounded: a missing test for real logic, a plausible edge-case bug, a moderate security/perf issue, an architectural violation, a dropped error state.
 - Low — style, naming, clarity, docs, micro-nits with NO behavioral impact.
 
-DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. Report EVERY substantive issue you find, not just the single most notable one — enumerate them all (correctness, error-handling, tests, and security). But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues.
+DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. Report EVERY substantive issue you find, not just the single most notable one — enumerate them all (correctness, error-handling, tests, and security). But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues. A security-sensitive PR (auth, access control, security rules, tenant isolation, uploads, user-supplied data) that you rate 0 High AND 0 Medium is a STRONG claim — do not make it unless you actually traced each new write/read's forgery + bypass surface and can name why each is closed; "the security model holds up" with no evidence is exactly the false all-clear that lets a real bypass ship. When in doubt on a security-sensitive write, a concrete-but-uncertain finding phrased as a question beats a silent pass.
+
+MISSING-CODE & UNCHANGED-FILE FINDINGS — the most important bugs often are NOT on a changed line: a Firestore/security rule that fails to mirror a check the new API route enforces, an authorization the new endpoint needs but never added, a validation the new input path lacks. These live in code the diff did NOT touch (or in the ABSENCE of code), so they have no green "+" line to sit on. You MUST still report them in findings[] — do NOT drop or downgrade a real bug just because it isn't on an added line. Anchor such a finding to the CLOSEST relevant changed line (the new code whose safety depends on the missing piece — the route handler, the write call, the rules block the PR did touch); the review harness carries findings that can't anchor exactly, so never suppress one for lack of a perfect line.
 
 RELIABILITY:
 - Substantiate every finding with the specific code and how it fails. If uncertain, phrase the body as a question but still include it.
-- Anchor each finding to a real line on the RIGHT (added/changed) side of the diff, at the head revision.
+- Prefer anchoring each finding to a real line on the RIGHT (added/changed) side of the diff at the head revision — BUT a missing-enforcement / unchanged-file finding (see above) is still required even when the best anchor is only the nearest related changed line.
 
 OUTPUT CONTRACT — non-negotiable:
 - EVERY issue MUST be a separate object in "findings" (path, line, severity, body). Prose outside findings[] is DISCARDED and LOST.
@@ -188,7 +190,7 @@ function prContextBlock(pr: PrMeta, priorComments: PriorComment[]): string {
     ? `\n\nPR description — the author's STATED INTENT; judge the change against it (spec-matching), and flag anything described-but-not-done, done-but-not-described, or scope creep:\n${pr.body.slice(0, 4000)}`
     : "";
   const prior = priorComments.length
-    ? `\n\nOther reviewers ALREADY left these comments — do NOT repeat them. Only report real issues they MISSED (if they covered everything and the PR is otherwise clean, return 0 findings):\n` +
+    ? `\n\nOther reviewers already commented on this PR (listed below). Do your OWN complete, independent review FIRST — reach your full finding list as if these did not exist — then, and only then, drop a finding ONLY when it is the SAME concrete point at the SAME location a reviewer already made (a literal duplicate). This de-dup is to avoid restating identical nits — it is NOT a budget: NEVER omit or downgrade a High or Medium because a reviewer commented in the same file or nearby, and never reduce yourself to "the residual after everyone else." Reviewers miss serious things (a security bypass they walked right past) and disagree — surfacing what they got wrong or missed is the whole point, so overlap on a real issue is expected and fine. Prior comments (for de-dup reference only):\n` +
       priorComments
         .slice(0, 40)
         .map((c) => `- ${c.path}:${c.line} — ${c.body.replace(/\s+/g, " ").slice(0, 160)}`)
@@ -229,7 +231,7 @@ ${clipped}
 
 Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
 {"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
-Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context — goes in findings[] as its own object, anchored to a changed line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified.`;
+Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context and missing-enforcement / unchanged-file bugs — goes in findings[] as its own object; anchor to the nearest relevant changed line when the issue isn't literally on an added line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified.`;
 
   // Generous timeout: the full-file context makes a deep review take longer than the 180s default.
   return parseReviewResult(await runClaude(prompt, 360_000));
@@ -285,7 +287,7 @@ ${clipped}
 
 After exploring the repo as needed, respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
 {"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
-Anchor every finding to a line on the RIGHT (added/changed) side of the diff. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified across the repo (the bypasses you looked for and didn't find, the callers you confirmed, the ACs the tests cover).`;
+Anchor each finding to a line on the RIGHT (added/changed) side of the diff where possible; for a missing-enforcement / unchanged-file bug (a rule that doesn't mirror a new check, an auth the new route lacks) anchor to the nearest relevant changed line and still report it — never drop it for lack of an exact line. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified across the repo (the bypasses you looked for and didn't find, the callers you confirmed, the ACs the tests cover).`;
 
   // 10-min timeout — exploring a repo is slower than a text-only pass. Read-only tools only.
   return parseReviewResult(await runClaude(prompt, 600_000, 3, { cwd: repoDir, repoTools: true }));
