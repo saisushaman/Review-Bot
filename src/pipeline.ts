@@ -174,6 +174,13 @@ async function produceReview(owner: string, repo: string, number: number): Promi
         `\n\n---\n**Findings that couldn't be anchored to the diff (${overflow.length}):**\n` +
         overflow.map((f) => `- **[${f.severity}]** \`${f.path}:${f.line}\` — ${f.body}`).join("\n");
     }
+    // Audit trail: the concrete risk areas the review examined and cleared. This is what makes a
+    // clean (0-finding) verdict high-signal instead of a rubber stamp — the reader can see WHAT was
+    // checked, not just "looks good". Always shown when present; most valuable on a clean PR.
+    if (result.checked.length) {
+      body +=
+        `\n\n---\n**Checked & cleared:**\n` + result.checked.map((c) => `- ${c}`).join("\n");
+    }
 
     const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
     // Record the review in our durable state — the authoritative "we reviewed this PR" fact the

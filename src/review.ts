@@ -16,6 +16,10 @@ export interface Finding {
 export interface ReviewResult {
   summary: string;
   findings: Finding[];
+  // The concrete risk areas the review EXAMINED and cleared — the audit trail that makes a
+  // "clean" verdict high-signal instead of a rubber stamp. Each item is a specific mechanism/file
+  // that was checked and why it's fine (not generic praise). Rendered under the review body.
+  checked: string[];
 }
 
 const SYSTEM = `You are a STAFF-level engineer doing a rigorous PR review. Your PRIMARY job is to catch SUBSTANTIVE defects — real bugs, security holes, breaking changes — NOT to nitpick style. Read the change against the FULL FILE CONTEXT provided below (the changed files' actual contents — call sites, types, invariants, error paths), reason about how the code behaves at runtime, and hunt hard for genuine problems.
@@ -51,7 +55,8 @@ RELIABILITY:
 
 OUTPUT CONTRACT — non-negotiable:
 - EVERY issue MUST be a separate object in "findings" (path, line, severity, body). Prose outside findings[] is DISCARDED and LOST.
-- "summary" is ONE sentence, overall read only — no issue descriptions. It MUST be consistent with findings: if it hints at any issue, that issue is a findings[] entry; if findings is empty the summary plainly says the PR is clean, no hedging.`;
+- "summary" is ONE sentence, overall read only — no issue descriptions. It MUST be consistent with findings: if it hints at any issue, that issue is a findings[] entry; if findings is empty the summary plainly says the PR is clean, no hedging.
+- "checked": the AUDIT TRAIL — 3 to 6 CONCRETE risk areas you actually examined and cleared, each naming the specific file/mechanism and WHY it holds (e.g. "app_factory is the only send-capable gateway site — poller instance is override-less, so no missed sender path"; "AC3 no-op path: name unset serializes byte-identical to the old address-only from_"). This is MANDATORY and most important when findings is empty: a clean PR with an empty or generic "checked" list reads as a rubber stamp and is unacceptable. Ban generic filler ("code looks good", "tests pass", "well structured") — every item must cite a real thing you verified in THIS diff/repo, ideally the exact risks that WOULD have been bugs if handled wrong (the bypass you looked for and didn't find, the caller you confirmed still compiles, the edge case the tests cover). If you truly examined nothing worth listing, you did not review deeply enough — go back.`;
 
 const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -223,8 +228,8 @@ ${clipped}
 \`\`\`${context}
 
 Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
-{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}]}
-Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context — goes in findings[] as its own object, anchored to a changed line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR.`;
+{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
+Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context — goes in findings[] as its own object, anchored to a changed line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified.`;
 
   // Generous timeout: the full-file context makes a deep review take longer than the 180s default.
   return parseReviewResult(await runClaude(prompt, 360_000));
@@ -233,17 +238,21 @@ Assign severity by REAL IMPACT (don't default to Low). Every issue — including
 /** Parse claude's JSON review output into findings. Coerces `line` (models emit "138" / 138.0) and
  *  drops any finding missing a valid positive-integer line or a required field (PR #31 fix). */
 function parseReviewResult(text: string): ReviewResult {
-  let parsed: { summary?: string; findings?: Finding[] };
+  let parsed: { summary?: string; findings?: Finding[]; checked?: unknown };
   try {
-    parsed = extractJson<{ summary?: string; findings?: Finding[] }>(text);
+    parsed = extractJson<{ summary?: string; findings?: Finding[]; checked?: unknown }>(text);
   } catch {
-    return { summary: "Review produced no parseable output.", findings: [] };
+    return { summary: "Review produced no parseable output.", findings: [], checked: [] };
   }
   return {
     summary: parsed.summary ?? "",
     findings: (parsed.findings ?? [])
       .map((f) => ({ ...f, line: Math.trunc(Number((f as { line?: unknown }).line)) }))
       .filter((f) => f && f.path && Number.isInteger(f.line) && f.line > 0 && f.severity && f.body),
+    // The audit trail (strings only); drop blanks so a lazy empty list can't sneak through as one item.
+    checked: (Array.isArray(parsed.checked) ? parsed.checked : [])
+      .map((c) => String(c).trim())
+      .filter((c) => c.length > 0),
   };
 }
 
@@ -275,8 +284,8 @@ ${clipped}
 \`\`\`
 
 After exploring the repo as needed, respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
-{"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}]}
-Anchor every finding to a line on the RIGHT (added/changed) side of the diff. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR.`;
+{"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
+Anchor every finding to a line on the RIGHT (added/changed) side of the diff. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified across the repo (the bypasses you looked for and didn't find, the callers you confirmed, the ACs the tests cover).`;
 
   // 10-min timeout — exploring a repo is slower than a text-only pass. Read-only tools only.
   return parseReviewResult(await runClaude(prompt, 600_000, 3, { cwd: repoDir, repoTools: true }));
