@@ -19,6 +19,15 @@ const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
 const SENSITIVE_RE =
   /\.rules\b|firestore\.rules|storage\.rules|firestore\.indexes|\brules_version\b|\ballow\s+(read|write|create|update|delete)\b|security[-_]?rules|\bIAM\b|\.iam\b|request\.auth|auth[-_]?(guard|middleware|check)|authoriz|permission|\brole[s]?\b|\brbac\b|\bacl\b|middleware|\.env\b|secret|credential|token|password|\bjwt\b|session|login|oauth|cors\b|csrf|sanitiz|upload|content[-_]?type|dockerfile|\.ya?ml$|webhook/i;
 
+// Safety net for the "concern hidden in the summary" failure: the model sometimes gestures at a real
+// problem in prose ("…but appears to drop the notification the docs guarantee") while filing ZERO
+// findings, so the review posts as clean and auto-approves — the exact way a defect ships green. When
+// a 0-finding review's summary carries this deficiency phrasing, we DON'T auto-approve; we hold and
+// point a human at it. Conservative (fires only on strong concern language) to avoid blocking real
+// clean approvals. The prompt already forbids this; this is defense-in-depth, not the primary fix.
+const SUMMARY_CONCERN_RE =
+  /\bappears? to (drop|miss|lack|omit|break|fail|skip)|\bfails? to\b|does(n'?t| not) (handle|guard|validate|check|cover|account|enforce)|the only (real )?(issue|concern|gap|problem)|\bbut (the|it|this|there|appears|seems|does|is|isn'?t|may|might|could|no )|however[,\s]|\bmissing\b|seems? to (drop|miss|lack|omit)|isn'?t (handled|guarded|validated|covered|enforced)/i;
+
 // Cache of completed fix-verification verdicts, keyed by PR head SHA + review-comment signature.
 // The verify step spawns a headless `claude -p` — the single most expensive thing the bot does.
 // A held PR (CI green, not blocked, but not all findings addressed yet) is re-checked by the 2-min
@@ -88,7 +97,7 @@ async function threadHasNote(client: WebClient, threadTs: string, marker: string
 /** What a review attempt produced. No Slack side effects — the caller owns reactions/replies. */
 type ReviewOutcome =
   | { kind: "skipped"; reason: string } // merged/closed/own-PR/not-allowed — nothing posted
-  | { kind: "posted"; url: string; findings: number }
+  | { kind: "posted"; url: string; findings: number; heldConcern?: string }
   | { kind: "failed"; error: string }; // transient (claude -p etc.) — caller should allow a retry
 
 /**
@@ -186,7 +195,14 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     // Record the review in our durable state — the authoritative "we reviewed this PR" fact the
     // approve/addressed path gates on (see maybeApprove).
     reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid);
-    return { kind: "posted", url, findings: result.findings.length };
+    // A clean review whose summary still gestures at a concern (contract violation) must NOT
+    // auto-approve — flag it so finalizeReview holds for a human (see SUMMARY_CONCERN_RE).
+    const heldConcern =
+      result.findings.length === 0 && SUMMARY_CONCERN_RE.test(result.summary)
+        ? result.summary
+        : undefined;
+    if (heldConcern) console.log(`[pr-review-bot] #${number}: clean-but-hedged summary — holding approval`);
+    return { kind: "posted", url, findings: result.findings.length, heldConcern };
   } catch (err) {
     return { kind: "failed", error: (err as Error).message };
   }
@@ -206,12 +222,23 @@ async function finalizeReview(
   repo: string,
   number: number,
   url: string,
-  findings: number
+  findings: number,
+  heldConcern?: string
 ): Promise<void> {
   const key = `${owner}/${repo}#${number}`;
   if (findings > 0) {
     await threadReply(client, replyTs, `👀 Automated review done — see comments: ${url}`);
     return; // leave :eyes:; approval waits for the author to address the comments
+  }
+  // Clean review but the summary still flags a concern (not filed as a finding) → do NOT auto-approve;
+  // point a human at the review so a buried issue can't ship under a green stamp.
+  if (heldConcern) {
+    await threadReply(
+      client,
+      replyTs,
+      `👀 Review found no filed findings but the summary flags a concern — needs a human look, not auto-approving: ${url}`
+    );
+    return;
   }
   // Clean review (no inline comments) → approve + ✅ if the gates are clear.
   const me = await gh.authUserLogin();
@@ -309,7 +336,7 @@ export async function handleReviewRequest(
       return;
     }
     // Comments → "see comments" (wait for author). Clean → approve + ✅ (gated). See finalizeReview.
-    await finalizeReview(client, ts, ts, owner, repo, number, outcome.url, outcome.findings);
+    await finalizeReview(client, ts, ts, owner, repo, number, outcome.url, outcome.findings, outcome.heldConcern);
   } finally {
     inflight.release(key);
   }
@@ -700,7 +727,7 @@ export async function handleMention(
       if (outcome.kind === "skipped") await threadReply(client, replyThread, `skipping — ${outcome.reason}.`);
       else if (outcome.kind === "failed")
         await threadReply(client, replyThread, `couldn't ${parsed.command} ${key}: ${outcome.error.slice(0, 200)}`);
-      else await finalizeReview(client, threadTs ?? messageTs, replyThread, owner, repo, number, outcome.url, outcome.findings);
+      else await finalizeReview(client, threadTs ?? messageTs, replyThread, owner, repo, number, outcome.url, outcome.findings, outcome.heldConcern);
     } finally {
       inflight.release(key);
     }
