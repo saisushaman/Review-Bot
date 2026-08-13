@@ -439,6 +439,7 @@ export async function maybeApprove(
         .join(",")}`;
       const key = verifyKey(owner, repo, number, meta.headOid, commentSig);
       let allAddressed: boolean;
+      let unaddressed: string[] = [];
       if (verifyMemo.has(key)) {
         allAddressed = verifyMemo.get(key)!;
       } else {
@@ -448,9 +449,27 @@ export async function maybeApprove(
           diff
         );
         allAddressed = res.allAddressed;
+        unaddressed = res.unaddressed;
         if (res.ok) verifyMemo.set(key, res.allAddressed);
       }
-      if (!allAddressed) return; // not every comment addressed in the commits yet → hold
+      if (!allAddressed) {
+        // Tell the author WHICH comments still look unaddressed — once per (head SHA + comment set),
+        // guarded so a restart (memo cleared) or the 2-min re-check doesn't repeat it. Freshly
+        // computed runs carry the list; memo hits don't (note already posted on the first miss).
+        // Only note CONCRETE unaddressed comments — skip internal markers like "(verification
+        // failed to run)" (those aren't cached, so they just retry silently next tick).
+        const concrete = unaddressed.filter((u) => !u.startsWith("("));
+        const MARK = "holding approval — these review comments don't look addressed yet";
+        if (concrete.length && !(await threadHasNote(client, parentTs, MARK))) {
+          await threadReply(
+            client,
+            parentTs,
+            `${MARK} (fix or reply to clear):\n` +
+              concrete.slice(0, 10).map((u) => `• ${u}`).join("\n")
+          );
+        }
+        return; // not every review comment addressed in the commits yet → hold
+      }
     }
   }
 
