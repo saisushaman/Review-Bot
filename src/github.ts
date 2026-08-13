@@ -306,6 +306,53 @@ export async function changedFilePaths(owner: string, repo: string, number: numb
   return data.map((f) => f.filename);
 }
 
+export interface OpenPrSummary {
+  number: number;
+  title: string;
+  author: string;
+  files: string[];
+}
+
+/**
+ * Every OTHER open PR in the repo, with the paths it changes — the context a single-PR review
+ * otherwise lacks. Without it the bot can't see that a sibling PR creates the same file (a merge
+ * collision), or that this PR deletes/renames something another open PR is stacked on (a sequencing
+ * hazard). Titles + changed paths are enough for the model to flag the interaction and say which PR
+ * to coordinate with; we deliberately don't pull their diffs (cost) — the review names the risk and
+ * whose branch to check, it doesn't adjudicate the other PR. Capped so a busy repo can't blow up the
+ * prompt. Best-effort: a per-PR file fetch that fails is skipped, never fails the review.
+ */
+export async function otherOpenPrs(
+  owner: string,
+  repo: string,
+  excludeNumber: number,
+  maxPrs = 8,
+  maxFilesEach = 40
+): Promise<OpenPrSummary[]> {
+  const { data: prs } = await octokit.pulls.list({ owner, repo, state: "open", per_page: 50 });
+  const others = prs.filter((p) => p.number !== excludeNumber).slice(0, maxPrs);
+  const out: OpenPrSummary[] = [];
+  for (const pr of others) {
+    try {
+      const { data: files } = await octokit.pulls.listFiles({
+        owner,
+        repo,
+        pull_number: pr.number,
+        per_page: 100,
+      });
+      out.push({
+        number: pr.number,
+        title: pr.title,
+        author: pr.user?.login ?? "",
+        files: files.map((f) => f.filename).slice(0, maxFilesEach),
+      });
+    } catch {
+      /* skip a PR whose files we can't list — cross-PR context is a bonus, never a hard dep */
+    }
+  }
+  return out;
+}
+
 /** ALL inline review comments on the PR (every reviewer: the bot's own automated review + codex/
  *  copilot/gemini/charlie + humans) — the findings the verify step confirms are addressed in the
  *  commits before approving. */

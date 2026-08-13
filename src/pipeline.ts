@@ -127,6 +127,9 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     // Comments other reviewers (copilot/gemini/charlie/humans) already left — the reviewer is told
     // not to repeat them, so its output stays additive instead of restating known feedback.
     const priorComments = await gh.allReviewComments(owner, repo, number).catch(() => []);
+    // Cross-PR context: the OTHER open PRs and the files they touch, so the review can catch merge/
+    // path collisions and cutover/sequencing hazards a single-PR-in-isolation review is blind to.
+    const otherPrs = await gh.otherOpenPrs(owner, repo, number).catch(() => []);
     // Deepest review: clone the repo at the PR head and let claude read the WHOLE codebase (callers,
     // types, cross-file effects). Falls back to the diff + fetched-file-content review if the clone
     // fails or the feature is off — repo context is a bonus, never a hard dependency.
@@ -151,7 +154,7 @@ async function produceReview(owner: string, repo: string, number: number): Promi
         }`
       );
       try {
-        result = await reviewPrWithRepo(meta, diff, checkout.dir, priorComments);
+        result = await reviewPrWithRepo(meta, diff, checkout.dir, priorComments, otherPrs);
       } finally {
         await checkout.cleanup();
       }
@@ -162,7 +165,7 @@ async function produceReview(owner: string, repo: string, number: number): Promi
       const files = await gh
         .changedFilesContent(owner, repo, number, meta.headOid)
         .catch(() => [] as Array<{ path: string; content: string; truncated: boolean }>);
-      result = await reviewPr(meta, diff, files, priorComments);
+      result = await reviewPr(meta, diff, files, priorComments, otherPrs);
     }
 
     // Split findings into those that anchor to a real diff line (posted inline) and those that

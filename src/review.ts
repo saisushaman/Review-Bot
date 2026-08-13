@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { config } from "./config.js";
-import type { PrMeta } from "./github.js";
+import type { PrMeta, OpenPrSummary } from "./github.js";
 
 // This bot reviews via HEADLESS CLAUDE CODE (`claude -p`) running on your Claude Code
 // subscription — NOT the metered Anthropic API. No API key / credits needed; the `claude`
@@ -41,6 +41,7 @@ RECURRING SECURITY CHECKS — apply whenever the PR touches file uploads, storag
 - Uploads / content types: a browser-EXECUTABLE upload that slips through is stored XSS. If an upload or storage rule allows a broad type (e.g. image/*), confirm it EXCLUDES or sanitizes svg (image/svg+xml) and html/xml — allowing image/* without carving out SVG is a real finding.
 - Stored paths / keys / URLs: a client-supplied path, storage key, or URL stored VERBATIM with no prefix/bucket/host allow-list check enables path traversal or cross-tenant / off-site references — flag any identifier persisted without validating it points where it must.
 - Identity fields: userId / createdBy / ownerId / authorId / senderId must be pinned to the authenticated principal (e.g. request.auth.uid), never taken from client input — an unpinned identity field is impersonation, and it's a real gap even when a denylist blocks other fields.
+- Supply-chain / build pinning: a base image or dependency pinned by a MUTABLE reference — a floating tag (\`:latest\`, \`:v1.2\`) or a branch — is not reproducible and can be re-pushed under you. When the repo's own docs/policy call for a digest (\`@sha256:…\`) or a cosign-verified/pinned base (grep the docs — CLAUDE.md, AGENTS.md, a gap-analysis/security doc), a Dockerfile/workflow using a plain tag CONTRADICTS that policy and is a finding; cite the policy line and the mutable ref.
 
 SEVERITY by real-world IMPACT — assign HONESTLY, do NOT default everything to Low:
 - High — could cause a production bug, security hole, data loss, outage, or broken build/call site. INCLUDES any auth/permission BYPASS, field forgery, impersonation, privilege escalation, or tenant-isolation break (a client reading/writing data it shouldn't) — these are High even when the "happy path" is correct, because the exploit path is concrete.
@@ -52,6 +53,8 @@ DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually m
 MISSING-CODE & UNCHANGED-FILE FINDINGS — the most important bugs often are NOT on a changed line: a Firestore/security rule that fails to mirror a check the new API route enforces, an authorization the new endpoint needs but never added, a validation the new input path lacks. These live in code the diff did NOT touch (or in the ABSENCE of code), so they have no green "+" line to sit on. You MUST still report them in findings[] — do NOT drop or downgrade a real bug just because it isn't on an added line. Anchor such a finding to the CLOSEST relevant changed line (the new code whose safety depends on the missing piece — the route handler, the write call, the rules block the PR did touch); the review harness carries findings that can't anchor exactly, so never suppress one for lack of a perfect line.
 
 EXHAUSTIVE-CLAIM CHECK — when a PR claims to handle a COMPLETE set ("delete every companyId-scoped record", "sweep all X", "cascade the whole thing", "cover all cases", "migrate every caller"), do NOT spot-check a sample: build the FULL set from the AUTHORITATIVE source (every collection in firestore.rules, every enum variant, every route/caller, every field) and reconcile it item-by-item — each is either HANDLED, a deliberate SURVIVOR (documented, with a reason), a GAP, or NOT-ACTUALLY-IN-SCOPE (e.g. keyed differently, or vestigial with no live writer). Report EVERY gap. And when the finding IS this completeness gap, put the WHOLE reconciliation in the body — the complete list of what's unaccounted for, not "several, e.g. A and B": a partial list of a completeness defect is itself incomplete, and it lets the reader fix the two you named and re-ship with the rest still orphaned. Excluding an item is a claim too — say why (vestigial/not-scoped), don't just omit it.
+
+CROSS-PR INTERACTIONS — when OTHER OPEN PRs are listed below (with the files each touches), this change does not land alone. Reason about how it composes with them, because a single-PR-in-isolation review is blind to exactly the bugs that only appear at integration: (a) MERGE / PATH COLLISION — another open PR creates or rewrites the SAME file with different content (a shared CI workflow, config, .gitignore, a barrel/index), so a naive merge silently clobbers one side's work; name both PRs and the file. (b) SEQUENCING / CUTOVER HAZARD — this PR deletes, renames, or moves something (an env var, a config key, a file, an export) that another open PR — or a documented cutover/migration step in THIS PR's own docs (HANDOFF.md, a migration guide) — still depends on; a cutover that removes a variable whose contents another change relies on drops that behavior in production even though each PR looks fine alone. (c) DUPLICATED / CONFLICTING INFRA — two PRs add overlapping tooling (two CI files doing similar jobs, two configs for one system) that must be combined or deconflicted, not both merged. Flag these as real findings (severity by impact — a lost router or clobbered test job is High/Medium), and say which PR to coordinate with. Do NOT adjudicate the other PR's internals — you only have its file list; name the interaction and whose branch to check.
 
 RELIABILITY:
 - Substantiate every finding with the specific code and how it fails. If uncertain, phrase the body as a question but still include it.
@@ -201,11 +204,27 @@ function prContextBlock(pr: PrMeta, priorComments: PriorComment[]): string {
   return body + prior;
 }
 
+/** The other open PRs and the files they touch — context for the CROSS-PR INTERACTIONS mandate
+ *  (path collisions, cutover/sequencing hazards, duplicated infra). Empty string when there are none. */
+function crossPrBlock(otherPrs: OpenPrSummary[]): string {
+  if (!otherPrs.length) return "";
+  return (
+    `\n\nOTHER OPEN PRs in this repo — this change will merge alongside them, so apply the CROSS-PR INTERACTIONS mandate (path/merge collisions on a shared file, cutover/sequencing hazards where this PR removes something another depends on, duplicated or conflicting infra). You have only their file lists, not their diffs — name the interaction and which PR to coordinate with, don't adjudicate their internals:\n` +
+    otherPrs
+      .map(
+        (p) =>
+          `- #${p.number} "${p.title}" (by ${p.author}) touches: ${p.files.join(", ") || "(no files listed)"}`
+      )
+      .join("\n")
+  );
+}
+
 export async function reviewPr(
   pr: PrMeta,
   diff: string,
   files: Array<{ path: string; content: string; truncated: boolean }> = [],
-  priorComments: PriorComment[] = []
+  priorComments: PriorComment[] = [],
+  otherPrs: OpenPrSummary[] = []
 ): Promise<ReviewResult> {
   const clipped =
     diff.length > config.maxDiffBytes
@@ -224,7 +243,7 @@ export async function reviewPr(
   const prompt = `${SYSTEM}
 
 PR: ${pr.title}
-Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}
+Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}${crossPrBlock(otherPrs)}
 
 Unified diff (the change to review):
 \`\`\`diff
@@ -269,7 +288,8 @@ export async function reviewPrWithRepo(
   pr: PrMeta,
   diff: string,
   repoDir: string,
-  priorComments: PriorComment[] = []
+  priorComments: PriorComment[] = [],
+  otherPrs: OpenPrSummary[] = []
 ): Promise<ReviewResult> {
   const clipped =
     diff.length > config.maxDiffBytes
@@ -280,7 +300,7 @@ export async function reviewPrWithRepo(
 You are running INSIDE a checkout of this repository at the PR's head commit (${pr.headOid}). Use the Read, Grep, and Glob tools to open ANY files you need — the changed files, their callers, the types/interfaces they use, related modules and tests — to review the change in full context. Do not guess about code you can open and read.
 
 PR: ${pr.title}
-Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}
+Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}${crossPrBlock(otherPrs)}
 
 The change under review (unified diff):
 \`\`\`diff
