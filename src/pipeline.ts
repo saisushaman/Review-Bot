@@ -169,9 +169,18 @@ async function produceReview(owner: string, repo: string, number: number): Promi
         await checkout.cleanup();
       }
     } else {
-      console.log(
-        `[pr-review-bot] #${number}: FAST review (diff+files) — ${changedLines} lines / ${meta.changedFiles} files, not sensitive`
-      );
+      if (wantDeep) {
+        // wantDeep was true but prepareRepoCheckout returned null → the clone/fetch FAILED and we're
+        // silently degrading to a shallow review. Say so loudly (not "not sensitive") — for a sensitive
+        // PR this is a real coverage loss, and the thoroughness gate below will hold approval on it.
+        console.warn(
+          `[pr-review-bot] #${number}: DEEP wanted but repo checkout FAILED → DEGRADED to FAST — a sensitive/large PR got a shallow review; approval will be held. Check the repo-clone auth/token.`
+        );
+      } else {
+        console.log(
+          `[pr-review-bot] #${number}: FAST review (diff+files) — ${changedLines} lines / ${meta.changedFiles} files, not sensitive`
+        );
+      }
       const files = await gh
         .changedFilesContent(owner, repo, number, meta.headOid)
         .catch(() => [] as Array<{ path: string; content: string; truncated: boolean }>);

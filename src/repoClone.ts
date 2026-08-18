@@ -36,10 +36,15 @@ export async function prepareRepoCheckout(
         timeout: GIT_TIMEOUT,
       });
     }
-    // Fetch just the PR head (blobless) → FETCH_HEAD.
-    await exec("git", ["-C", bare, "fetch", "--filter=blob:none", "origin", `pull/${number}/head`], {
-      timeout: GIT_TIMEOUT,
-    });
+    // Fetch just the PR head (blobless) → FETCH_HEAD. Fetch from the EXPLICIT authUrl (current token),
+    // NOT the named `origin` remote: origin's URL was baked in at clone time with whatever token was
+    // current THEN, so after a token rotation a cached bare repo fetches with a STALE token and fails
+    // "Invalid username or token" — which then silently degrades a DEEP review to FAST (see pipeline).
+    await exec(
+      "git",
+      ["-C", bare, "fetch", "--filter=blob:none", authUrl(owner, repo), `pull/${number}/head`],
+      { timeout: GIT_TIMEOUT }
+    );
     const wt = path.join(config.repoCacheRoot, "wt", `${owner}-${repo}-${number}-${process.pid}-${Date.now()}`);
     fs.mkdirSync(path.dirname(wt), { recursive: true });
     await exec("git", ["-C", bare, "worktree", "add", "--detach", "--force", wt, "FETCH_HEAD"], {
