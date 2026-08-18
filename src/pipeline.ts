@@ -140,12 +140,22 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     // non-sensitive PR takes the fast text path: its changed-file contents already give full context
     // (callers, types, invariants within the touched files), no clone needed.
     const changedLines = meta.additions + meta.deletions;
-    const sensitive = SENSITIVE_RE.test(diff);
+    // Sensitivity is judged from the PR's TITLE + description + the diff (paths + code), not the diff
+    // alone — a PR literally titled "Shared … OAuth tokens readable by every user" MUST route DEEP even
+    // if the diff's own text is terse. A security-sensitive PR ALWAYS gets the whole-repo review (never
+    // the diff-only FAST path), so a second leak path in an UNCHANGED file can't be missed (this is the
+    // ActualChat #55 miss: a credential-exposure fix that went FAST because only its diff was scanned).
+    const sensitive = SENSITIVE_RE.test(`${meta.title}\n${meta.body}\n${diff}`);
     const wantDeep =
       config.repoContextReview &&
       (sensitive ||
         changedLines > config.deepReviewMaxLines ||
         meta.changedFiles > config.deepReviewMaxFiles);
+    // Log the decision WITH its inputs, so a surprising route (a security PR going FAST) is diagnosable
+    // from the log instead of a mystery — the FAST/DEEP line below alone hid why.
+    console.log(
+      `[pr-review-bot] #${number}: routing → ${wantDeep ? "DEEP" : "FAST"} (repoContext=${config.repoContextReview} sensitive=${sensitive} lines=${changedLines}/${config.deepReviewMaxLines} files=${meta.changedFiles}/${config.deepReviewMaxFiles})`
+    );
     const checkout = wantDeep ? await prepareRepoCheckout(owner, repo, number) : null;
     if (checkout) {
       console.log(
