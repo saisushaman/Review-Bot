@@ -487,6 +487,7 @@ export async function maybeApprove(
       const key = verifyKey(owner, repo, number, meta.headOid, commentSig);
       let allAddressed: boolean;
       let unaddressed: string[] = [];
+      let verifyOk = true; // memo only ever caches COMPLETED verifications, so a memo hit is ok=true
       if (verifyMemo.has(key)) {
         allAddressed = verifyMemo.get(key)!;
       } else {
@@ -497,15 +498,27 @@ export async function maybeApprove(
         );
         allAddressed = res.allAddressed;
         unaddressed = res.unaddressed;
+        verifyOk = res.ok;
         if (res.ok) verifyMemo.set(key, res.allAddressed);
       }
       if (!allAddressed) {
-        // Tell the author WHICH comments still look unaddressed — once per (head SHA + comment set),
-        // guarded so a restart (memo cleared) or the 2-min re-check doesn't repeat it. Freshly
-        // computed runs carry the list; memo hits don't (note already posted on the first miss).
-        // Only note CONCRETE unaddressed comments — skip internal markers like "(verification
-        // failed to run)" (those aren't cached, so they just retry silently next tick).
         const concrete = unaddressed.filter((u) => !u.startsWith("("));
+        if (!verifyOk) {
+          // Verification couldn't COMPLETE (a batch timed out) — do NOT stall silently. Say so, hold
+          // (never approve on an unverified fix), and let it retry. One-time per head SHA + comment set.
+          const MARK = "holding approval — couldn't finish verifying the review comments";
+          if (!(await threadHasNote(client, parentTs, MARK))) {
+            await threadReply(
+              client,
+              parentTs,
+              `${MARK} (${findings.length} comments — the check timed out). Not approving on an unverified fix; it'll retry automatically.` +
+                (concrete.length ? `\nSo far these look unaddressed:\n${concrete.slice(0, 8).map((u) => `• ${u}`).join("\n")}` : "")
+            );
+          }
+          return; // couldn't verify → hold
+        }
+        // Verification COMPLETED and found real gaps — tell the author which comments. One-time per
+        // (head SHA + comment set), guarded so a restart or the 2-min re-check doesn't repeat it.
         const MARK = "holding approval — these review comments don't look addressed yet";
         if (concrete.length && !(await threadHasNote(client, parentTs, MARK))) {
           await threadReply(

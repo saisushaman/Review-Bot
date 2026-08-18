@@ -331,8 +331,9 @@ export interface VerifyResult {
  * there is no sign it was handled. Fails CLOSED (allAddressed=false) if verification can't run, so
  * the bot never approves on an unverified fix.
  */
-export async function verifyFix(findings: Finding[], prDiff: string): Promise<VerifyResult> {
-  if (findings.length === 0) return { allAddressed: true, unaddressed: [], ok: true };
+/** Verify ONE batch of findings against the diff. Internal — verifyFix splits into batches so each
+ *  prompt's reasoning load is small enough to finish inside the timeout. Same fail-closed contract. */
+async function verifyBatch(findings: Finding[], prDiff: string): Promise<VerifyResult> {
   const list = findings.map((f, i) => `${i}. ${f.path}:${f.line} — ${f.body}`).join("\n");
   const prompt = `You are checking whether prior code-review findings were ADDRESSED in the CURRENT state of a pull request. For EACH finding, decide if the diff below resolves it.
 
@@ -350,7 +351,7 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of exactly 
 {"verdicts": [{"i": <finding index int>, "addressed": true|false, "why": "<=12 words"}]}`;
   try {
     // Verify runs on config.verifyModel when set (e.g. Haiku) — cheaper/faster than the review pass.
-    const text = await runClaude(prompt, 150_000, 3, { model: config.verifyModel || undefined });
+    const text = await runClaude(prompt, 180_000, 3, { model: config.verifyModel || undefined });
     const parsed = extractJson<{ verdicts?: Array<{ i?: number; addressed?: boolean; why?: string }> }>(
       text
     );
@@ -365,4 +366,28 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of exactly 
   } catch {
     return { allAddressed: false, unaddressed: ["(verification failed to run)"], ok: false };
   }
+}
+
+// One prompt over dozens of comments blows the timeout — 76 comments on ai-gateway #9 hung verify,
+// which then held approval silently forever. Split into small batches so each fits the timeout.
+const VERIFY_BATCH = 15;
+
+export async function verifyFix(findings: Finding[], prDiff: string): Promise<VerifyResult> {
+  if (findings.length === 0) return { allAddressed: true, unaddressed: [], ok: true };
+  // Batch and verify concurrently, then aggregate. Fails CLOSED: if ANY batch couldn't complete,
+  // ok=false so the caller holds (never approves on a partial verdict) — but batches that DID finish
+  // still contribute their concrete unaddressed items, so the note can name real gaps.
+  const batches: Finding[][] = [];
+  for (let i = 0; i < findings.length; i += VERIFY_BATCH) batches.push(findings.slice(i, i + VERIFY_BATCH));
+  const results = await Promise.all(batches.map((b) => verifyBatch(b, prDiff)));
+  const ok = results.every((r) => r.ok);
+  const failed = results.filter((r) => !r.ok).length;
+  const concrete = results.flatMap((r) => r.unaddressed.filter((u) => !u.startsWith("(")));
+  return {
+    allAddressed: ok && concrete.length === 0,
+    unaddressed: ok
+      ? concrete
+      : [...concrete, `(verification incomplete — ${failed}/${batches.length} batches timed out over ${findings.length} comments)`],
+    ok,
+  };
 }
