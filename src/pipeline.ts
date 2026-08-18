@@ -205,16 +205,27 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     }
 
     const url = await gh.postReview(owner, repo, number, meta.headOid, body, comments);
+    // THOROUGHNESS GATE: a security-sensitive PR that only got the shallow FAST review (no whole-repo
+    // pass — e.g. repoContextReview off or the clone was skipped) is NOT reviewed thoroughly enough to
+    // auto-approve on. Record that, and surface it so BOTH approval paths hold ("don't approve until
+    // the review is thorough"). A deep review, or a non-sensitive PR, is sufficient.
+    const reviewWasDeep = !!checkout;
+    const insufficient = sensitive && !reviewWasDeep;
     // Record the review in our durable state — the authoritative "we reviewed this PR" fact the
-    // approve/addressed path gates on (see maybeApprove).
-    reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid);
+    // approve/addressed path gates on (see maybeApprove) — with whether it was thorough enough.
+    reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid, insufficient);
+    if (insufficient)
+      console.log(`[pr-review-bot] #${number}: security-sensitive PR got only a FAST review — holding approval until a deep review`);
     // A clean review whose summary still gestures at a concern (contract violation) must NOT
     // auto-approve — flag it so finalizeReview holds for a human (see SUMMARY_CONCERN_RE).
     const heldConcern =
-      result.findings.length === 0 && SUMMARY_CONCERN_RE.test(result.summary)
-        ? result.summary
-        : undefined;
-    if (heldConcern) console.log(`[pr-review-bot] #${number}: clean-but-hedged summary — holding approval`);
+      insufficient
+        ? "the review wasn't thorough enough (security-sensitive PR reviewed on the shallow path) — needs a deep whole-repo review before approval"
+        : result.findings.length === 0 && SUMMARY_CONCERN_RE.test(result.summary)
+          ? result.summary
+          : undefined;
+    if (heldConcern && !insufficient)
+      console.log(`[pr-review-bot] #${number}: clean-but-hedged summary — holding approval`);
     return { kind: "posted", url, findings: result.findings.length, heldConcern };
   } catch (err) {
     return { kind: "failed", error: (err as Error).message };
@@ -403,6 +414,23 @@ export async function maybeApprove(
 
   const meta = await gh.getPr(owner, repo, number);
   if (meta.state !== "open" || meta.merged) return; // nothing to approve
+
+  // THOROUGHNESS GATE: never approve on a review that wasn't thorough enough — a security-sensitive
+  // PR whose recorded review was only the shallow FAST pass, not the deep whole-repo one. The fix
+  // could be perfectly addressed and CI green, but a shallow review may have MISSED a finding, so
+  // "addressed" isn't enough — the review itself has to be thorough first. Hold and ask for a deep
+  // re-review ("don't approve until the review is thorough"). One-time note, then hold silently.
+  if (reviewState.reviewInsufficient(reviewState.prKey(owner, repo, number))) {
+    const MARK = "holding approval — the review wasn't thorough enough";
+    if (!(await threadHasNote(client, parentTs, MARK))) {
+      await threadReply(
+        client,
+        parentTs,
+        `${MARK}: this is a security-sensitive PR that only got a shallow review. Re-tag me to run the deep whole-repo review before it can be approved.`
+      );
+    }
+    return;
+  }
 
   // Gate 1 (team pref): approve on verified-fix + GREEN CI — do NOT wait for GitHub review threads
   // to be marked resolved. CI pending/failing ⇒ hold silently (no chat noise); re-checks next reply.
