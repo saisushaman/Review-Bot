@@ -6,7 +6,19 @@ import type { PrMeta, OpenPrSummary } from "./github.js";
 // subscription — NOT the metered Anthropic API. No API key / credits needed; the `claude`
 // CLI must be installed and logged in (run `claude setup-token` or `claude` → `/login` once).
 
-export type Severity = "High" | "Medium" | "Low";
+export type Severity = "Blocking" | "High" | "Medium" | "Low";
+// Canonical order, most-severe first — the single source of truth for sorting + the review tally.
+export const SEVERITIES: Severity[] = ["Blocking", "High", "Medium", "Low"];
+/** Normalize a model-emitted severity to one of the four canonical levels (case-insensitive; maps
+ *  common synonyms). Returns null for anything unrecognized so the parser can drop it. */
+function normSeverity(v: unknown): Severity | null {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "blocking" || s === "blocker" || s === "critical") return "Blocking";
+  if (s === "high") return "High";
+  if (s === "medium" || s === "moderate") return "Medium";
+  if (s === "low" || s === "nit" || s === "minor") return "Low";
+  return null;
+}
 export interface Finding {
   path: string;
   line: number; // line in the PR head (RIGHT side of the diff)
@@ -26,13 +38,13 @@ const SYSTEM = `You are a STAFF-level engineer doing a rigorous PR review. Your 
 
 Review across five vectors, weighting correctness + security heavily:
 1. Correctness — logic errors, wrong conditions, off-by-one, null/undefined derefs, unhandled promise rejections, wrong async/ordering, race conditions, state that can go inconsistent, breaking changes to existing callers, wrong error handling (swallowed errors; fail-OPEN where it must fail-closed).
-2. Security — think like an attacker. MISSING/weak authorization or ownership checks; injection/SSRF; unvalidated or unbounded input; path traversal; IDOR; over-broad permissions; unsafe deserialization; secrets/PII in logs; and — critically — **whether server-side enforcement can be BYPASSED at another layer**. On Firebase/Firestore especially: clients can write/read DIRECTLY via the SDK, so any constraint the API route enforces (userId, status, source, role, ownership, which fields are settable) MUST also be enforced in the security RULES — a rule that only checks auth + companyId but lets the client set userId/status/source/type is a HIGH-severity forgery / impersonation / privilege-escalation gap, even if the API route does it "correctly." When the diff touches firestore.rules / IAM / any auth policy, spell out exactly what a malicious authenticated client could forge or access that the rule fails to prevent.
+2. Security — think like an attacker. MISSING/weak authorization or ownership checks; injection/SSRF; unvalidated or unbounded input; path traversal; IDOR; over-broad permissions; unsafe deserialization; secrets/PII in logs; and — critically — **whether server-side enforcement can be BYPASSED at another layer**. On Firebase/Firestore especially: clients can write/read DIRECTLY via the SDK, so any constraint the API route enforces (userId, status, source, role, ownership, which fields are settable) MUST also be enforced in the security RULES — a rule that only checks auth + companyId but lets the client set userId/status/source/type is a BLOCKING (merge-stopping) forgery / impersonation / privilege-escalation gap, even if the API route does it "correctly." When the diff touches firestore.rules / IAM / any auth policy, spell out exactly what a malicious authenticated client could forge or access that the rule fails to prevent.
 3. Architecture — drift from the codebase's established patterns, leaky abstractions, coupling that will break, misuse of shared modules (judge against the provided file context, not personal taste).
 4. Tests — untested new logic/branches, deleted tests, tautological assertions. Name the SPECIFIC branch left uncovered.
 5. Spec matching — PR title/description vs the actual diff: work described-but-not-done, done-but-not-described, scope creep.
 
 THREAT-MODEL & CLAIM-CHECK MANDATE — run this on ANY change touching auth, access control, security rules, tenant isolation, or user-supplied data:
-- Trace whether a constraint enforced in one layer is ALSO enforced where an attacker could go AROUND it. A check that lives only in an API route / server handler, with no matching enforcement in the DB security rules (so a client can hit the datastore directly), is a real — usually HIGH — vulnerability. Ask concretely: "what can a malicious but authenticated user write or read by skipping the happy path?"
+- Trace whether a constraint enforced in one layer is ALSO enforced where an attacker could go AROUND it. A check that lives only in an API route / server handler, with no matching enforcement in the DB security rules (so a client can hit the datastore directly), is a real — usually BLOCKING — vulnerability. Ask concretely: "what can a malicious but authenticated user write or read by skipping the happy path?"
 - CROSS-CHECK the PR's own security claims — in its description or the docs it edits — against what the code/rules ACTUALLY enforce. If the docs say "the client cannot set status/source" but the rules don't stop the client from setting them, that contradiction is a finding (cite both the claim and the gap).
 - Explicitly consider field forgery, impersonation (e.g. a forged userId), status/state tampering, and privilege escalation — not just "is there a check somewhere."
 - When a write is ALLOWED with a DENYLIST of forbidden fields (e.g. Firestore keys().hasAny([...])), the list is only as good as it is COMPLETE — verify it blocks EVERY server-owned field a client must not set. Blocking some (projectId, sync markers) while omitting others (userId, status, source, type) still lets the client forge the omitted ones. Enumerate the fields a client could set on that write and confirm each is either validated or blocked; a partial denylist is a gap, not a fix — even (especially) when the PR is a hardening pass that "looks" thorough.
@@ -43,12 +55,13 @@ RECURRING SECURITY CHECKS — apply whenever the PR touches file uploads, storag
 - Identity fields: userId / createdBy / ownerId / authorId / senderId must be pinned to the authenticated principal (e.g. request.auth.uid), never taken from client input — an unpinned identity field is impersonation, and it's a real gap even when a denylist blocks other fields.
 - Supply-chain / build pinning: a base image or dependency pinned by a MUTABLE reference — a floating tag (\`:latest\`, \`:v1.2\`) or a branch — is not reproducible and can be re-pushed under you. When the repo's own docs/policy call for a digest (\`@sha256:…\`) or a cosign-verified/pinned base (grep the docs — CLAUDE.md, AGENTS.md, a gap-analysis/security doc), a Dockerfile/workflow using a plain tag CONTRADICTS that policy and is a finding; cite the policy line and the mutable ref.
 
-SEVERITY by real-world IMPACT — assign HONESTLY, do NOT default everything to Low:
-- High — could cause a production bug, security hole, data loss, outage, or broken build/call site. INCLUDES any auth/permission BYPASS, field forgery, impersonation, privilege escalation, or tenant-isolation break (a client reading/writing data it shouldn't) — these are High even when the "happy path" is correct, because the exploit path is concrete.
-- Medium — a real problem but bounded: a missing test for real logic, a plausible edge-case bug, a moderate security/perf issue, an architectural violation, a dropped error state.
+SEVERITY by real-world IMPACT — assign HONESTLY across FOUR levels, do NOT default everything to Low. Post EACH finding as its OWN inline comment tagged with its level; a non-trivial PR normally warrants SEVERAL:
+- Blocking — MUST be fixed before this PR merges. A concrete exploit path (auth/permission BYPASS, field forgery, impersonation, privilege escalation, tenant-isolation break — a client reading/writing data it shouldn't), data loss, an outage, a broken build / failing call site, or a security hole with a real attack path. If merging as-is would ship a known defect or vulnerability, it is Blocking — even when the "happy path" is correct, because the exploit path is concrete.
+- High — a serious problem very likely to bite in production (a real logic bug, a plausible security issue, a breaking change to an existing caller) that should be fixed, but is not by itself an outright merge-stopper.
+- Medium — a real but bounded problem: a missing test for real logic, a plausible edge-case bug, a moderate security/perf issue, an architectural violation, a dropped error state.
 - Low — style, naming, clarity, docs, micro-nits with NO behavioral impact.
 
-DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. Report EVERY substantive issue you find, not just the single most notable one — enumerate them all (correctness, error-handling, tests, and security). But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues. A security-sensitive PR (auth, access control, security rules, tenant isolation, uploads, user-supplied data) that you rate 0 High AND 0 Medium is a STRONG claim — do not make it unless you actually traced each new write/read's forgery + bypass surface and can name why each is closed; "the security model holds up" with no evidence is exactly the false all-clear that lets a real bypass ship. When in doubt on a security-sensitive write, a concrete-but-uncertain finding phrased as a question beats a silent pass.
+DEPTH MANDATE: a non-trivial PR that you review with ONLY Low findings usually means you didn't look hard enough — dig into the actual logic and its callers in the provided files. Report EVERY substantive issue you find, not just the single most notable one — enumerate them all (correctness, error-handling, tests, and security). But NEVER invent or pad: every finding must cite a CONCRETE defect visible in the diff or the provided files, WITH a failure scenario. If the PR is genuinely clean, return 0 findings — don't manufacture issues. A security-sensitive PR (auth, access control, security rules, tenant isolation, uploads, user-supplied data) that you rate 0 Blocking AND 0 High AND 0 Medium is a STRONG claim — do not make it unless you actually traced each new write/read's forgery + bypass surface and can name why each is closed; "the security model holds up" with no evidence is exactly the false all-clear that lets a real bypass ship. When in doubt on a security-sensitive write, a concrete-but-uncertain finding phrased as a question beats a silent pass.
 
 MISSING-CODE & UNCHANGED-FILE FINDINGS — the most important bugs often are NOT on a changed line: a Firestore/security rule that fails to mirror a check the new API route enforces, an authorization the new endpoint needs but never added, a validation the new input path lacks. These live in code the diff did NOT touch (or in the ABSENCE of code), so they have no green "+" line to sit on. You MUST still report them in findings[] — do NOT drop or downgrade a real bug just because it isn't on an added line. Anchor such a finding to the CLOSEST relevant changed line (the new code whose safety depends on the missing piece — the route handler, the write call, the rules block the PR did touch); the review harness carries findings that can't anchor exactly, so never suppress one for lack of a perfect line.
 
@@ -251,7 +264,7 @@ ${clipped}
 \`\`\`${context}
 
 Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
-{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
+{"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "Blocking" | "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
 Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context and missing-enforcement / unchanged-file bugs — goes in findings[] as its own object; anchor to the nearest relevant changed line when the issue isn't literally on an added line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified.`;
 
   // Generous timeout: the full-file context makes a deep review take longer than the 180s default.
@@ -270,8 +283,17 @@ function parseReviewResult(text: string): ReviewResult {
   return {
     summary: parsed.summary ?? "",
     findings: (parsed.findings ?? [])
-      .map((f) => ({ ...f, line: Math.trunc(Number((f as { line?: unknown }).line)) }))
-      .filter((f) => f && f.path && Number.isInteger(f.line) && f.line > 0 && f.severity && f.body),
+      // Coerce line ("138"/138.0 → 138) and NORMALIZE severity to one of the four canonical levels
+      // (Blocking/High/Medium/Low). A finding whose severity can't be normalized is dropped.
+      .map((f) => ({
+        ...f,
+        line: Math.trunc(Number((f as { line?: unknown }).line)),
+        severity: normSeverity((f as { severity?: unknown }).severity),
+      }))
+      .filter(
+        (f): f is Finding =>
+          !!f && !!f.path && Number.isInteger(f.line) && f.line > 0 && !!f.severity && !!f.body
+      ),
     // The audit trail (strings only); drop blanks so a lazy empty list can't sneak through as one item.
     checked: (Array.isArray(parsed.checked) ? parsed.checked : [])
       .map((c) => String(c).trim())
@@ -308,7 +330,7 @@ ${clipped}
 \`\`\`
 
 After exploring the repo as needed, respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
-{"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
+{"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "Blocking" | "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
 Anchor each finding to a line on the RIGHT (added/changed) side of the diff where possible; for a missing-enforcement / unchanged-file bug (a rule that doesn't mirror a new check, an auth the new route lacks) anchor to the nearest relevant changed line and still report it — never drop it for lack of an exact line. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified across the repo (the bypasses you looked for and didn't find, the callers you confirmed, the ACs the tests cover).`;
 
   // 10-min timeout — exploring a repo is slower than a text-only pass. Read-only tools only.

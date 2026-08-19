@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
-import { reviewPr, reviewPrWithRepo, verifyFix, type Severity } from "./review.js";
+import { reviewPr, reviewPrWithRepo, verifyFix, SEVERITIES, type Severity } from "./review.js";
 import { prepareRepoCheckout } from "./repoClone.js";
 import type { CiEvent } from "./webhook.js";
 import * as reviewState from "./reviewState.js";
@@ -9,7 +9,8 @@ import * as inflight from "./inflight.js";
 import * as mentions from "./mentions.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const sevOrder: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 };
+// Sort key: most-severe first (Blocking → High → Medium → Low), derived from the canonical list.
+const sevOrder = Object.fromEntries(SEVERITIES.map((s, i) => [s, i])) as Record<Severity, number>;
 
 // A PR is routed to the DEEP whole-repo review (vs. the fast text path) whenever its diff touches
 // something security-sensitive, where cross-layer / rules / auth reasoning across the whole codebase
@@ -201,9 +202,9 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     const overflow = ordered.filter((f) => !anchor.get(f.path)?.has(f.line));
     const comments = inline.map((f) => ({ path: f.path, line: f.line, body: `**[${f.severity}]** ${f.body}` }));
 
-    const tally = (["High", "Medium", "Low"] as Severity[])
-      .map((s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`)
-      .join(" · ");
+    const tally = SEVERITIES.map(
+      (s) => `${result.findings.filter((f) => f.severity === s).length} ${s}`
+    ).join(" · ");
     let body = `Automated review — ${result.summary}\n\nSummary: ${tally}.`;
     if (overflow.length) {
       body +=
