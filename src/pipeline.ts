@@ -112,11 +112,16 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     return { kind: "skipped", reason: `${owner}/${repo} isn't on the review allowlist` };
 
   const meta = await gh.getPr(owner, repo, number);
-  if (meta.merged || meta.state !== "open")
+  if (meta.merged || meta.state !== "open") {
+    // Record it as HANDLED so the 2-min catch-up never re-processes a merged/closed PR every sweep —
+    // that re-processing is exactly what re-posted the same "Skipping — already merged" reply over and
+    // over. Once recorded, handleReviewRequest's hasReviewed() gate returns silently next time.
+    reviewState.markReviewed(reviewState.prKey(owner, repo, number), meta.headOid);
     return {
       kind: "skipped",
       reason: `PR #${number} is ${meta.merged ? "already merged" : `already ${meta.state}`}; nothing to review`,
     };
+  }
 
   const me = await gh.authUserLogin();
   if (config.skipOwnPrs && meta.authorLogin === me)
@@ -353,7 +358,10 @@ export async function handleReviewRequest(
   try {
     const outcome = await produceReview(owner, repo, number);
     if (outcome.kind === "skipped") {
-      await threadReply(client, ts, `Skipping — ${outcome.reason}.`); // leave :eyes: so it isn't re-picked
+      // Post the skip note AT MOST ONCE per thread — never re-spam the same "Skipping —" reply if the
+      // catch-up somehow re-processes this PR (belt-and-suspenders behind the handled-record above).
+      if (!(await threadHasNote(client, ts, "Skipping —")))
+        await threadReply(client, ts, `Skipping — ${outcome.reason}.`);
       return;
     }
     if (outcome.kind === "failed") {
