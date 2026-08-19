@@ -314,6 +314,30 @@ async function eyesInfo(
   return { present: !!eyes, weOwn: !!eyes && (eyes.users ?? []).includes(botUserId) };
 }
 
+// Peer REVIEW BOTS whose :eyes: claim we do NOT yield to — the user runs more than one review bot and
+// wants each to review independently, so a peer bot's claim must not make us skip the PR. We can't
+// detect is_bot at runtime (the bot token lacks the users:read scope), so we list them; override via
+// PEER_REVIEW_BOT_IDS (comma-separated). Default: Alden's Assistant (U0BFMJJ2EMT).
+const PEER_REVIEW_BOTS = new Set(
+  (process.env.PEER_REVIEW_BOT_IDS ?? "U0BFMJJ2EMT")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+/**
+ * True iff someone OTHER than us and OTHER than a known peer review bot has added the claim :eyes: —
+ * i.e. a human (or an unknown non-peer reactor) is on it, the case we still yield to. A peer bot's
+ * claim alone returns false, so Alden's Assistant claiming a PR never blocks us from reviewing it.
+ */
+async function humanClaimed(client: WebClient, ts: string, botUserId: string): Promise<boolean> {
+  const res = await client.reactions.get({ channel: config.slack.channelId, timestamp: ts });
+  const eyes = (
+    (res.message as { reactions?: Array<{ name: string; users?: string[] }> } | undefined)?.reactions ?? []
+  ).find((r) => r.name === config.claimEmoji);
+  return (eyes?.users ?? []).some((u) => u !== botUserId && !PEER_REVIEW_BOTS.has(u));
+}
+
 /**
  * A PR-review request (PR URL + tags the required user). Ownership is the DURABLE record, not just
  * the :eyes: reaction:
@@ -338,12 +362,18 @@ export async function handleReviewRequest(
 
   if (reviewState.hasReviewed(key)) return; // durable record: already reviewed
   const eyes = await eyesInfo(client, ts, botUserId);
-  if (eyes.present && !eyes.weOwn) return; // a human / other bot claimed it — yield
-  if (!eyes.present) {
-    // Unclaimed → debounce (yield to a human reacting in the window), re-check, then claim.
+  // Yield ONLY to a HUMAN reviewer's claim — NOT to a peer review bot. Alden's Assistant (or any
+  // other bot) claiming :eyes: must not make us skip; we review independently alongside it.
+  if (eyes.present && !eyes.weOwn && (await humanClaimed(client, ts, botUserId))) return;
+  if (!eyes.weOwn) {
+    // We don't hold a claim yet (unclaimed, or only peer-bots have claimed). Debounce so a human
+    // reacting in the window still wins, re-check, then add OUR OWN :eyes: (alongside any bot's).
     await sleep(config.claimDebounceMs);
-    if ((await eyesInfo(client, ts, botUserId)).present) return; // claimed during the debounce
-    await client.reactions.add({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji });
+    const re = await eyesInfo(client, ts, botUserId);
+    if (!re.weOwn) {
+      if (re.present && !re.weOwn && (await humanClaimed(client, ts, botUserId))) return; // a human claimed in the window
+      await client.reactions.add({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji });
+    }
   }
   // We own the claim now — fresh, or a recovered stuck one. Guard so a concurrent sweep that sees the
   // same un-recorded :eyes: doesn't double-review while this pass runs.
