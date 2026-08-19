@@ -50,6 +50,13 @@ const verifyKey = (owner: string, repo: string, n: number, headOid: string, comm
 type CachedSignal = { user?: string; text?: string; ts?: string } | null;
 const signalCache = new Map<string, { latestReply: string; signal: CachedSignal }>();
 
+// After a review FAILS, cool off before the 2-min sweep retries it. Without this a PERSISTENT failure
+// (e.g. claude -p auth down) re-reviews every sweep — churning the :eyes: claim and re-spawning
+// claude -p endlessly. In-memory (cleared on restart); a fresh commit or an explicit @-mention
+// re-tag still triggers an immediate review (those paths don't consult this).
+const failedCooldown = new Map<string, number>(); // prKey -> epoch ms of last failure
+const FAIL_COOLDOWN_MS = 10 * 60 * 1000;
+
 async function reactionNames(client: WebClient, ts: string): Promise<string[]> {
   const res = await client.reactions.get({ channel: config.slack.channelId, timestamp: ts });
   const reactions = (res.message as { reactions?: Array<{ name: string }> } | undefined)?.reactions ?? [];
@@ -343,6 +350,8 @@ export async function handleReviewRequest(
   const key = reviewState.prKey(owner, repo, number);
 
   if (reviewState.hasReviewed(key)) return; // durable record: already reviewed
+  const cooling = failedCooldown.get(key);
+  if (cooling && Date.now() - cooling < FAIL_COOLDOWN_MS) return; // recently failed → back off, no churn
   const eyes = await eyesInfo(client, ts, botUserId);
   // If another account already claimed it with :eyes: — a human OR another review bot (e.g. Alden's
   // Assistant) — YIELD. The user does not want us duplicating a PR another bot already reviewed.
@@ -366,16 +375,19 @@ export async function handleReviewRequest(
       return;
     }
     if (outcome.kind === "failed") {
-      // Don't leave it silently claimed-but-unreviewed after a transient failure — release :eyes: so
-      // a re-post/re-tag (or the catch-up) re-triggers it.
+      // Release :eyes: so a TRANSIENT failure can be retried by the next sweep. But guard the failure
+      // REPLY so a PERSISTENT failure (e.g. claude -p auth down, as in the ActualChat #55 pileup) can't
+      // re-post the same "⚠️ failed" message every 2-min sweep — post it AT MOST ONCE per thread.
+      failedCooldown.set(key, Date.now()); // back off before the sweep retries this PR
       await client.reactions
         .remove({ channel: config.slack.channelId, timestamp: ts, name: config.claimEmoji })
         .catch(() => undefined);
-      await threadReply(
-        client,
-        ts,
-        `⚠️ Automated review failed after retries — unclaimed so it can be retried. Re-post or re-tag to trigger again. (${outcome.error.slice(0, 200)})`
-      ).catch(() => undefined);
+      if (!(await threadHasNote(client, ts, "Automated review failed")))
+        await threadReply(
+          client,
+          ts,
+          `⚠️ Automated review failed after retries — will keep retrying. Re-post or re-tag to trigger again sooner. (${outcome.error.slice(0, 200)})`
+        ).catch(() => undefined);
       console.warn(`[pr-review-bot] review failed for ${owner}/${repo}#${number}: ${outcome.error}`);
       return;
     }
