@@ -265,17 +265,7 @@ async function finalizeReview(
     await threadReply(client, replyTs, `👀 Automated review done — see comments: ${url}`);
     return; // leave :eyes:; approval waits for the author to address the comments
   }
-  // Clean review but the summary still flags a concern (not filed as a finding) → do NOT auto-approve;
-  // point a human at the review so a buried issue can't ship under a green stamp.
-  if (heldConcern) {
-    await threadReply(
-      client,
-      replyTs,
-      `👀 Review found no filed findings but the summary flags a concern — needs a human look, not auto-approving: ${url}`
-    );
-    return;
-  }
-  // Clean review (no inline comments) → approve + ✅ if the gates are clear.
+  // Clean review (no inline comments) → approve + ✅. CI is THE only gate (user 2026-08-20).
   const me = await gh.authUserLogin();
   if (await gh.hasApprovedBy(owner, repo, number, me)) {
     await threadReply(client, replyTs, `✅ Clean review, no issues — already approved ${key}.`);
@@ -285,7 +275,6 @@ async function finalizeReview(
   const problems: string[] = [];
   if (meta.state !== "open" || meta.merged) problems.push(`PR is ${meta.merged ? "merged" : meta.state}`);
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) problems.push("CI isn't green");
-  if (await gh.changesRequested(owner, repo, number)) problems.push("another reviewer requested changes");
   if (problems.length) {
     await threadReply(client, replyTs, `✅ Clean review — no issues found. Holding approval: ${problems.join("; ")}.`);
     return;
@@ -441,76 +430,10 @@ export async function maybeApprove(
   // could be perfectly addressed and CI green, but a shallow review may have MISSED a finding, so
   // "addressed" isn't enough — the review itself has to be thorough first. Hold and ask for a deep
   // re-review ("don't approve until the review is thorough"). One-time note, then hold silently.
-  if (reviewState.reviewInsufficient(reviewState.prKey(owner, repo, number))) {
-    const MARK = "holding approval — the review wasn't thorough enough";
-    if (!(await threadHasNote(client, parentTs, MARK))) {
-      await threadReply(
-        client,
-        parentTs,
-        `${MARK}: this is a security-sensitive PR that only got a shallow review. Re-tag me to run the deep whole-repo review before it can be approved.`
-      );
-    }
-    return;
-  }
-
-  // Gate 1 (team pref): approve on verified-fix + GREEN CI — do NOT wait for GitHub review threads
-  // to be marked resolved. CI pending/failing ⇒ hold silently (no chat noise); re-checks next reply.
+  // THE ONLY GATE (user 2026-08-20): hold ONLY while CI isn't green. On the "addressed" signal we
+  // approve — no comment/reply checks, no thoroughness check, no duplicate guard, no CHANGES_REQUESTED
+  // block. CI pending/failing ⇒ hold SILENTLY (no chat noise) and re-check on the next reply/sweep.
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
-
-  // Don't approve over an EXPLICIT block: hold silently if a reviewer marked CHANGES_REQUESTED
-  // (human / codex / copilot / gemini / charlie). We do NOT require threads to be marked "resolved"
-  // — the author's "addressed" signal + no CHANGES_REQUESTED is the bar (user-set 2026-07-17).
-  if (await gh.changesRequested(owner, repo, number)) return;
-
-  // Duplicate guard — hold ONLY for a GENUINE competing duplicate: another open PR for the SAME
-  // ticket, or (when neither carries a ticket) one with a STRONG changed-file overlap. Merely sharing
-  // one incidental file (a router/index/config) is NOT competition — that was the #45↔#42 false
-  // positive. Different tickets are never competing. See gh.competingOpenPrs.
-  const myTicket = gh.ticketKey(meta.title, meta.headRefName);
-  const myFiles = (await gh.changedFilePaths(owner, repo, number)).filter(gh.isCodeFile);
-  const dupes =
-    myTicket || myFiles.length ? await gh.competingOpenPrs(owner, repo, number, myTicket, myFiles) : [];
-  if (dupes.length) {
-    // Post the "competing PR" note AT MOST ONCE per thread, then hold silently on later replies.
-    const MARK = "holding approval: this competes with";
-    if (!(await threadHasNote(client, parentTs, MARK))) {
-      await threadReply(
-        client,
-        parentTs,
-        `Fix looks addressed & CI is green, but ${MARK} #${dupes.join(", #")} (same ticket/implementation). A human should pick one — I don't close/merge PRs.`
-      );
-    }
-    return;
-  }
-
-  // ENGAGEMENT GATE (VERIFY_FIXES_BEFORE_APPROVE): on the "addressed" signal, approve as long as every
-  // review THREAD has been RESPONDED to — resolved OR replied to — even if the code doesn't strictly
-  // "fix" it (user 2026-08-20). We do NOT re-verify fixes with claude -p anymore (it over-held: it
-  // judged the DIFF, missed thread replies, and treated baz's "Commit X addressed" follow-ups and the
-  // author's own replies as findings). Working on THREADS (roots), a follow-up reply is never a finding.
-  if (config.verifyFixesBeforeApprove) {
-    const threads = await gh.reviewThreads(owner, repo, number);
-    // A finding = a thread rooted by a REVIEWER (not the PR author's own thread). Unhandled = neither
-    // resolved nor replied to — i.e. genuinely ignored. Everything else counts as engaged → approvable.
-    const unhandled = threads.filter(
-      (t) => t.rootAuthor !== meta.authorLogin && !t.isResolved && !t.hasReply
-    );
-    if (unhandled.length) {
-      const MARK = "holding approval — these review comments have no reply yet";
-      if (!(await threadHasNote(client, parentTs, MARK))) {
-        await threadReply(
-          client,
-          parentTs,
-          `${MARK} (reply to them — or resolve the thread — to clear; a code fix isn't required):\n` +
-            unhandled
-              .slice(0, 10)
-              .map((t) => `• ${cleanCommentLabel(t.rootBody) ?? "(comment)"}`)
-              .join("\n")
-        );
-      }
-      return; // some comments were never responded to → hold
-    }
-  }
 
   await gh.approvePr(owner, repo, number);
   // Post the approved reply FIRST, THEN the ✅ tick on the PR post (user-set order).
@@ -703,7 +626,6 @@ async function approveOnRequest(
   }
   const problems: string[] = [];
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) problems.push("CI isn't green");
-  if (await gh.changesRequested(owner, repo, number)) problems.push("a reviewer requested changes");
   if (problems.length) {
     await threadReply(client, replyThread, `can't approve ${key} yet — ${problems.join("; ")}.`);
     return;
