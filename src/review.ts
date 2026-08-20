@@ -210,6 +210,28 @@ export interface PriorComment {
   body: string;
 }
 
+/** A clean, human one-liner for a review comment (used in the "holding approval — not addressed"
+ *  note). Review bodies are markdown — baz uses `### Title` headers, ours uses `**[Low]**` tags —
+ *  and a raw slice cuts mid-word and shows the markup. Take the first meaningful line, strip the
+ *  markup/severity tag, and truncate at a WORD boundary. */
+function cleanCommentLabel(body?: string): string | undefined {
+  if (!body) return undefined;
+  const firstLine =
+    body
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.replace(/[#*`_>\-\s]/g, "").length > 0) ?? body;
+  const s = firstLine
+    .replace(/^#{1,6}\s*/, "") // markdown header (baz's "### Title")
+    .replace(/^\*\*\[(?:Blocking|High|Medium|Low)\]\*\*\s*/i, "") // our severity tag
+    .replace(/\*\*/g, "")
+    .replace(/`/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (s.length <= 90) return s;
+  return s.slice(0, 90).replace(/\s+\S*$/, "").trimEnd() + "…"; // cut at a word boundary
+}
+
 /** Shared review context: the PR's stated intent (for spec-matching). We deliberately do NOT feed
  *  other reviewers' comments and do NOT tell the bot to de-dup against them — that "report only the
  *  net-new residual beyond everyone else" behavior is what throttled the bot to one finding on a
@@ -491,7 +513,7 @@ Respond with ONLY a JSON object — no prose, no markdown fences — of exactly 
       return { allAddressed: false, unaddressed: ["(verification incomplete)"], ok: false };
     const unaddressed = verdicts
       .filter((v) => v.addressed !== true)
-      .map((v) => findings[v.i ?? -1]?.body?.slice(0, 60) ?? `finding ${v.i}`);
+      .map((v) => cleanCommentLabel(findings[v.i ?? -1]?.body) ?? `finding ${v.i}`);
     return { allAddressed: unaddressed.length === 0, unaddressed, ok: true };
   } catch {
     return { allAddressed: false, unaddressed: ["(verification failed to run)"], ok: false };
