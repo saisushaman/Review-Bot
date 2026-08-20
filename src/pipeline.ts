@@ -275,6 +275,7 @@ async function finalizeReview(
   const problems: string[] = [];
   if (meta.state !== "open" || meta.merged) problems.push(`PR is ${meta.merged ? "merged" : meta.state}`);
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) problems.push("CI isn't green");
+  if (await gh.changesRequested(owner, repo, number)) problems.push("another reviewer requested changes");
   if (problems.length) {
     await threadReply(client, replyTs, `✅ Clean review — no issues found. Holding approval: ${problems.join("; ")}.`);
     return;
@@ -430,10 +431,31 @@ export async function maybeApprove(
   // could be perfectly addressed and CI green, but a shallow review may have MISSED a finding, so
   // "addressed" isn't enough — the review itself has to be thorough first. Hold and ask for a deep
   // re-review ("don't approve until the review is thorough"). One-time note, then hold silently.
-  // THE ONLY GATE (user 2026-08-20): hold ONLY while CI isn't green. On the "addressed" signal we
-  // approve — no comment/reply checks, no thoroughness check, no duplicate guard, no CHANGES_REQUESTED
-  // block. CI pending/failing ⇒ hold SILENTLY (no chat noise) and re-check on the next reply/sweep.
+  // THE ONLY TWO GATES (user 2026-08-20): CI green, and no reviewer explicitly blocking. On the
+  // "addressed" signal we approve — no comment/reply checks, no thoroughness check, no duplicate
+  // guard. Both hold SILENTLY (no chat noise) and re-check on the next reply/sweep.
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
+  // Never approve over an EXPLICIT block: a human/bot reviewer marked CHANGES_REQUESTED.
+  if (await gh.changesRequested(owner, repo, number)) return;
+
+  // Duplicate guard — hold for a GENUINE competing duplicate: another OPEN PR for the SAME ticket,
+  // or (when neither carries a ticket) one with a STRONG changed-file overlap. Sharing one incidental
+  // file (router/index/config) is NOT competition. Note posted at most once, then holds silently.
+  const myTicket = gh.ticketKey(meta.title, meta.headRefName);
+  const myFiles = (await gh.changedFilePaths(owner, repo, number)).filter(gh.isCodeFile);
+  const dupes =
+    myTicket || myFiles.length ? await gh.competingOpenPrs(owner, repo, number, myTicket, myFiles) : [];
+  if (dupes.length) {
+    const MARK = "holding approval: this competes with";
+    if (!(await threadHasNote(client, parentTs, MARK))) {
+      await threadReply(
+        client,
+        parentTs,
+        `Fix looks addressed & CI is green, but ${MARK} #${dupes.join(", #")} (same ticket/implementation). A human should pick one — I don't close/merge PRs.`
+      );
+    }
+    return;
+  }
 
   await gh.approvePr(owner, repo, number);
   // Post the approved reply FIRST, THEN the ✅ tick on the PR post (user-set order).
@@ -626,6 +648,7 @@ async function approveOnRequest(
   }
   const problems: string[] = [];
   if (!(await gh.ciGreen(owner, repo, meta.headOid))) problems.push("CI isn't green");
+  if (await gh.changesRequested(owner, repo, number)) problems.push("a reviewer requested changes");
   if (problems.length) {
     await threadReply(client, replyThread, `can't approve ${key} yet — ${problems.join("; ")}.`);
     return;
