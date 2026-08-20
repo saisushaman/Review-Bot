@@ -330,13 +330,18 @@ const LENSES: string[] = [
  *  points at the same line survive but true duplicates across lenses collapse), union "checked",
  *  first real summary. Cap findings so a runaway lens can't flood the PR. */
 function mergeResults(results: ReviewResult[]): ReviewResult {
+  // Merge only TRUE duplicates across lenses (same path:line AND near-identical opening) — that keeps
+  // two DIFFERENT concerns at the same line (a code-semantic point vs a docs-drift point) as separate
+  // comments, which is the baz-level coverage we want, while collapsing a finding two lenses phrased
+  // the same way. Non-anchorable findings key on the body alone.
   const findings: Finding[] = [];
   const seen = new Set<string>();
+  const sig = (b: string) => b.slice(0, 70).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   for (const r of results)
     for (const f of r.findings) {
-      const k = `${f.path}:${f.line}:${f.body.slice(0, 50).toLowerCase().replace(/\s+/g, " ")}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
+      const key = f.line > 0 ? `${f.path}:${f.line}:${sig(f.body)}` : `${f.path}:${sig(f.body)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       findings.push(f);
     }
   const checked = [...new Set(results.flatMap((r) => r.checked))].slice(0, 8);
