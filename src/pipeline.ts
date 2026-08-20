@@ -457,6 +457,20 @@ export async function maybeApprove(
     return;
   }
 
+  // OWN-COMMENTS gate (user 2026-08-20): don't approve while OUR OWN review comments sit untouched —
+  // that's how #159 self-approved 2 min after posting 2 findings. Once the author replies to (or
+  // resolves) them, approve. Scoped to threads WE rooted, so baz's comments and its "Commit X
+  // addressed" follow-ups are irrelevant here. Holds SILENTLY — no chat note, no spam.
+  const ownUnanswered = (await gh.reviewThreads(owner, repo, number)).filter(
+    (t) => t.rootAuthor === me && !t.isResolved && !t.hasReply
+  );
+  if (ownUnanswered.length) {
+    console.log(
+      `[pr-review-bot] #${number}: holding approval — ${ownUnanswered.length} of our own review comments have no reply yet`
+    );
+    return;
+  }
+
   await gh.approvePr(owner, repo, number);
   // Post the approved reply FIRST, THEN the ✅ tick on the PR post (user-set order).
   await threadReply(client, parentTs, "✅ Approved — CI green.");
