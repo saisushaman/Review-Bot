@@ -214,7 +214,7 @@ export interface PriorComment {
  *  note). Review bodies are markdown — baz uses `### Title` headers, ours uses `**[Low]**` tags —
  *  and a raw slice cuts mid-word and shows the markup. Take the first meaningful line, strip the
  *  markup/severity tag, and truncate at a WORD boundary. */
-function cleanCommentLabel(body?: string): string | undefined {
+export function cleanCommentLabel(body?: string): string | undefined {
   if (!body) return undefined;
   const firstLine =
     body

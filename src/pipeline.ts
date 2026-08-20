@@ -1,7 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 import { config, parsePrUrl, tagsRequiredUser } from "./config.js";
 import * as gh from "./github.js";
-import { reviewPr, reviewPrWithRepo, verifyFix, SEVERITIES, type Severity } from "./review.js";
+import { reviewPr, reviewPrWithRepo, cleanCommentLabel, SEVERITIES, type Severity } from "./review.js";
 import { prepareRepoCheckout } from "./repoClone.js";
 import type { CiEvent } from "./webhook.js";
 import * as reviewState from "./reviewState.js";
@@ -28,17 +28,6 @@ const SENSITIVE_RE =
 // clean approvals. The prompt already forbids this; this is defense-in-depth, not the primary fix.
 const SUMMARY_CONCERN_RE =
   /\bappears? to (drop|miss|lack|omit|break|fail|skip)|\bfails? to\b|does(n'?t| not) (handle|guard|validate|check|cover|account|enforce)|the only (real )?(issue|concern|gap|problem)|\bbut (the|it|this|there|appears|seems|does|is|isn'?t|may|might|could|no )|however[,\s]|\bmissing\b|seems? to (drop|miss|lack|omit)|isn'?t (handled|guarded|validated|covered|enforced)/i;
-
-// Cache of completed fix-verification verdicts, keyed by PR head SHA + review-comment signature.
-// The verify step spawns a headless `claude -p` — the single most expensive thing the bot does.
-// A held PR (CI green, not blocked, but not all findings addressed yet) is re-checked by the 2-min
-// self-heal sweep indefinitely; without this it would re-run that `claude -p` every 2 minutes for
-// an answer that CANNOT change until the author pushes a new commit (new head SHA) or a reviewer
-// adds a comment. Both are captured in the key, so a genuine change busts the cache and re-verifies.
-// Only COMPLETE verdicts are cached (VerifyResult.ok) — fail-closed/incomplete runs are retried.
-const verifyMemo = new Map<string, boolean>();
-const verifyKey = (owner: string, repo: string, n: number, headOid: string, commentSig: string) =>
-  `${owner}/${repo}#${n}@${headOid}:${commentSig}`;
 
 // Cache of the newest "addressed" signal per PR-request message, validated against Slack's
 // `latest_reply` timestamp. The self-heal sweep runs every 2 min; re-fetching a thread's replies
@@ -494,65 +483,32 @@ export async function maybeApprove(
     return;
   }
 
-  // VERIFY (opt-in via VERIFY_FIXES_BEFORE_APPROVE, default OFF): re-check via claude -p that the
-  // findings are actually fixed in the commits before approving. Default trusts the author's
-  // "addressed" signal + the objective gates above (CI green, no CHANGES_REQUESTED, not a real
-  // duplicate) — "if they said addressed, approve it". Enable for stricter approvals.
+  // ENGAGEMENT GATE (VERIFY_FIXES_BEFORE_APPROVE): on the "addressed" signal, approve as long as every
+  // review THREAD has been RESPONDED to — resolved OR replied to — even if the code doesn't strictly
+  // "fix" it (user 2026-08-20). We do NOT re-verify fixes with claude -p anymore (it over-held: it
+  // judged the DIFF, missed thread replies, and treated baz's "Commit X addressed" follow-ups and the
+  // author's own replies as findings). Working on THREADS (roots), a follow-up reply is never a finding.
   if (config.verifyFixesBeforeApprove) {
-    const findings = await gh.allReviewComments(owner, repo, number);
-    if (findings.length) {
-      // Signature (count + each path:line) + head SHA fully determine the verdict → reuse the cache
-      // instead of re-spawning claude -p when nothing changed since the last hold.
-      const commentSig = `${findings.length}|${findings
-        .map((c) => `${c.path}:${c.line}`)
-        .sort()
-        .join(",")}`;
-      const key = verifyKey(owner, repo, number, meta.headOid, commentSig);
-      let allAddressed: boolean;
-      let unaddressed: string[] = [];
-      let verifyOk = true; // memo only ever caches COMPLETED verifications, so a memo hit is ok=true
-      if (verifyMemo.has(key)) {
-        allAddressed = verifyMemo.get(key)!;
-      } else {
-        const diff = await gh.getPrDiff(owner, repo, number);
-        const res = await verifyFix(
-          findings.map((c) => ({ path: c.path, line: c.line, severity: "Medium" as Severity, body: c.body })),
-          diff
+    const threads = await gh.reviewThreads(owner, repo, number);
+    // A finding = a thread rooted by a REVIEWER (not the PR author's own thread). Unhandled = neither
+    // resolved nor replied to — i.e. genuinely ignored. Everything else counts as engaged → approvable.
+    const unhandled = threads.filter(
+      (t) => t.rootAuthor !== meta.authorLogin && !t.isResolved && !t.hasReply
+    );
+    if (unhandled.length) {
+      const MARK = "holding approval — these review comments have no reply yet";
+      if (!(await threadHasNote(client, parentTs, MARK))) {
+        await threadReply(
+          client,
+          parentTs,
+          `${MARK} (reply to them — or resolve the thread — to clear; a code fix isn't required):\n` +
+            unhandled
+              .slice(0, 10)
+              .map((t) => `• ${cleanCommentLabel(t.rootBody) ?? "(comment)"}`)
+              .join("\n")
         );
-        allAddressed = res.allAddressed;
-        unaddressed = res.unaddressed;
-        verifyOk = res.ok;
-        if (res.ok) verifyMemo.set(key, res.allAddressed);
       }
-      if (!allAddressed) {
-        const concrete = unaddressed.filter((u) => !u.startsWith("("));
-        if (!verifyOk) {
-          // Verification couldn't COMPLETE (a batch timed out) — do NOT stall silently. Say so, hold
-          // (never approve on an unverified fix), and let it retry. One-time per head SHA + comment set.
-          const MARK = "holding approval — couldn't finish verifying the review comments";
-          if (!(await threadHasNote(client, parentTs, MARK))) {
-            await threadReply(
-              client,
-              parentTs,
-              `${MARK} (${findings.length} comments — the check timed out). Not approving on an unverified fix; it'll retry automatically.` +
-                (concrete.length ? `\nSo far these look unaddressed:\n${concrete.slice(0, 8).map((u) => `• ${u}`).join("\n")}` : "")
-            );
-          }
-          return; // couldn't verify → hold
-        }
-        // Verification COMPLETED and found real gaps — tell the author which comments. One-time per
-        // (head SHA + comment set), guarded so a restart or the 2-min re-check doesn't repeat it.
-        const MARK = "holding approval — these review comments don't look addressed yet";
-        if (concrete.length && !(await threadHasNote(client, parentTs, MARK))) {
-          await threadReply(
-            client,
-            parentTs,
-            `${MARK} (fix or reply to clear):\n` +
-              concrete.slice(0, 10).map((u) => `• ${u}`).join("\n")
-          );
-        }
-        return; // not every review comment addressed in the commits yet → hold
-      }
+      return; // some comments were never responded to → hold
     }
   }
 

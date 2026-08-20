@@ -179,6 +179,37 @@ export async function changesRequested(
   }
 }
 
+export interface ReviewThread {
+  isResolved: boolean;
+  hasReply: boolean; // more than one comment in the thread → the root finding got a reply
+  rootAuthor: string;
+  rootBody: string;
+}
+
+/** Every review-comment THREAD on the PR, with whether it's resolved and whether it has a reply.
+ *  Used by the light "was the review responded to?" approval gate — a thread counts as handled if
+ *  it's resolved OR has at least one reply (the author engaged), regardless of a code fix. */
+export async function reviewThreads(
+  owner: string,
+  repo: string,
+  number: number
+): Promise<ReviewThread[]> {
+  const q = `query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ pullRequest(number:$n){
+    reviewThreads(first:100){ nodes{ isResolved comments(first:1){ totalCount nodes{ author{login} body } } } }
+  }}}`;
+  try {
+    const res: any = await octokit.graphql(q, { o: owner, r: repo, n: number });
+    return (res.repository.pullRequest.reviewThreads.nodes ?? []).map((t: any) => ({
+      isResolved: !!t.isResolved,
+      hasReply: (t.comments?.totalCount ?? 0) > 1,
+      rootAuthor: t.comments?.nodes?.[0]?.author?.login ?? "",
+      rootBody: t.comments?.nodes?.[0]?.body ?? "",
+    }));
+  } catch {
+    return [];
+  }
+}
+
 export async function hasApprovedBy(
   owner: string,
   repo: string,
