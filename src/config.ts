@@ -86,6 +86,10 @@ export const config = {
   // behavior); requires repoContextReview=true for any deep review at all.
   deepReviewMaxLines: Number(opt("DEEP_REVIEW_MAX_LINES", "250")),
   deepReviewMaxFiles: Number(opt("DEEP_REVIEW_MAX_FILES", "8")),
+  // MULTI-LENS review: run the review once per focused lens (defects / attribution+contract /
+  // test-rigor+docs) and merge, so the model can't consolidate to one finding (see review.ts LENSES).
+  // Default ON — this is what gets the bot to baz-level coverage. REVIEW_LENSES=false = single pass.
+  reviewLenses: bool("REVIEW_LENSES", true),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */

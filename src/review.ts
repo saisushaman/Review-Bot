@@ -258,7 +258,7 @@ export async function reviewPr(
         .join("\n")
     : "";
 
-  const prompt = `${SYSTEM}
+  const base = `${SYSTEM}
 
 PR: ${pr.title}
 Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.changedFiles} files · head ${pr.headOid}${prContextBlock(pr, priorComments)}${crossPrBlock(otherPrs)}
@@ -266,14 +266,23 @@ Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.chang
 Unified diff (the change to review):
 \`\`\`diff
 ${clipped}
-\`\`\`${context}
+\`\`\`${context}`;
+  const tail = `
 
 Respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
 {"summary": "ONE sentence, overall read only — NO issue descriptions, NO severity tally", "findings": [{"path": "repo-relative path from the diff", "line": <integer, RIGHT side of the diff>, "severity": "Blocking" | "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
 Assign severity by REAL IMPACT (don't default to Low). Every issue — including ones you spot from the file context and missing-enforcement / unchanged-file bugs — goes in findings[] as its own object; anchor to the nearest relevant changed line when the issue isn't literally on an added line. The summary must be consistent with findings. Empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified.`;
 
-  // Generous timeout: the full-file context makes a deep review take longer than the 180s default.
-  return parseReviewResult(await runClaude(prompt, 360_000));
+  const lenses = config.reviewLenses ? LENSES : [""];
+  // Generous per-pass timeout: full-file context takes longer than the 180s default. Lenses run in parallel.
+  const results = await Promise.all(
+    lenses.map((lens) =>
+      runClaude(base + (lens ? lensBlock(lens) : "") + tail, 360_000)
+        .then(parseReviewResult)
+        .catch(() => ({ summary: "", findings: [], checked: [] }) as ReviewResult)
+    )
+  );
+  return mergeResults(results);
 }
 
 /** Parse claude's JSON review output into findings. Coerces `line` (models emit "138" / 138.0) and
@@ -306,10 +315,45 @@ function parseReviewResult(text: string): ReviewResult {
   };
 }
 
+// MULTI-LENS review: a single "find everything" pass makes the model satisfice — it consolidates to
+// ~1 finding and files the rest as "checked", no matter how the prompt is tuned (validated on TMASA
+// #158). So we run the review under several FOCUSED lenses in parallel and merge — each lens hunts a
+// narrow dimension exhaustively, surfacing findings the general pass buried. This is how a top
+// reviewer gets to 5+ comments. Override the set with REVIEW_LENSES=off to fall back to one pass.
+const LENSES: string[] = [
+  "CORRECTNESS, error-handling, concurrency/state consistency, and ROBUSTNESS to malformed / edge / missing inputs (a parser or test that crashes or silently PASSES on a bad value), plus SECURITY (auth/permission bypass, injection, field forgery, unsafe input reaching a sink)",
+  "SEMANTIC ACCURACY & ATTRIBUTION — any value whose PROVENANCE is misrepresented (model-inferred, summarized, defaulted, or widened data presented to a user as their own verbatim/requested input); and CONTRACT/DOCSTRING accuracy — does the code actually match its stated docstring / Protocol / type signature (a transform the contract omits)?",
+  "TEST RIGOR — does each test verify the PRODUCTION path, or pass via a fake/mock that skips the very check it claims to prove? happy-path-only coverage, tautological assertions, a new branch with no test; and DOC / EXAMPLE / SPEC correctness — a README/handoff now contradicting the code, an example passing a raw string where an enum/type is required, an unverified guarantee, spec-vs-diff drift",
+];
+
+/** Merge per-lens results into one: union findings (dedupe by path:line + body-prefix so distinct
+ *  points at the same line survive but true duplicates across lenses collapse), union "checked",
+ *  first real summary. Cap findings so a runaway lens can't flood the PR. */
+function mergeResults(results: ReviewResult[]): ReviewResult {
+  const findings: Finding[] = [];
+  const seen = new Set<string>();
+  for (const r of results)
+    for (const f of r.findings) {
+      const k = `${f.path}:${f.line}:${f.body.slice(0, 50).toLowerCase().replace(/\s+/g, " ")}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      findings.push(f);
+    }
+  const checked = [...new Set(results.flatMap((r) => r.checked))].slice(0, 8);
+  const summary =
+    results.map((r) => r.summary).find((s) => s && !s.startsWith("Review produced")) ??
+    results[0]?.summary ??
+    "";
+  return { summary, findings: findings.slice(0, 15), checked };
+}
+
+const lensBlock = (lens: string): string =>
+  `\n\nREVIEW LENS FOR THIS PASS — focus your hunt specifically on: ${lens}. Be EXHAUSTIVE within this lens and file EVERY issue you find in it as its own finding; other passes cover the other dimensions, so do NOT hold back or defer here. Findings OUTSIDE this lens are still welcome if you spot them, but this lens is your priority.`;
+
 /**
  * WHOLE-REPO review: run `claude -p` INSIDE the PR's checkout (repoDir) with read-only file tools,
  * so it can Read/Grep/Glob across the ENTIRE codebase to reason about the change in full context —
- * callers, types, cross-file effects, tests. The deepest review. Same output contract + parser.
+ * callers, types, cross-file effects, tests. The deepest review. Runs one pass PER LENS and merges.
  */
 export async function reviewPrWithRepo(
   pr: PrMeta,
@@ -322,7 +366,7 @@ export async function reviewPrWithRepo(
     diff.length > config.maxDiffBytes
       ? diff.slice(0, config.maxDiffBytes) + "\n…[diff truncated]…"
       : diff;
-  const prompt = `${SYSTEM}
+  const base = `${SYSTEM}
 
 You are running INSIDE a checkout of this repository at the PR's head commit (${pr.headOid}). Use the Read, Grep, and Glob tools to open ANY files you need — the changed files, their callers, the types/interfaces they use, related modules and tests — to review the change in full context. Do not guess about code you can open and read.
 
@@ -332,14 +376,23 @@ Author: ${pr.authorLogin} · +${pr.additions}/-${pr.deletions} across ${pr.chang
 The change under review (unified diff):
 \`\`\`diff
 ${clipped}
-\`\`\`
+\`\`\``;
+  const tail = `
 
 After exploring the repo as needed, respond with ONLY a JSON object — no prose, no markdown fences — of this exact shape:
 {"summary": "ONE sentence, overall read only — NO issue descriptions", "findings": [{"path": "repo-relative path", "line": <integer, RIGHT side of the diff>, "severity": "Blocking" | "High" | "Medium" | "Low", "body": "the concrete defect + a failure scenario or fix. Do NOT prefix severity."}], "checked": ["3-6 concrete risk areas you examined and cleared, each naming the file/mechanism and why it holds — the audit trail; no generic filler"]}
-Anchor each finding to a line on the RIGHT (added/changed) side of the diff where possible; for a missing-enforcement / unchanged-file bug (a rule that doesn't mirror a new check, an auth the new route lacks) anchor to the nearest relevant changed line and still report it — never drop it for lack of an exact line. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified across the repo (the bypasses you looked for and didn't find, the callers you confirmed, the ACs the tests cover).`;
+Anchor each finding to a line on the RIGHT (added/changed) side of the diff where possible; for a missing-enforcement / unchanged-file bug (a rule that doesn't mirror a new check, an auth the new route lacks) anchor to the nearest relevant changed line and still report it — never drop it for lack of an exact line. Assign severity by REAL IMPACT. The summary must be consistent with findings; empty findings ONLY for a genuinely clean PR — and then "checked" MUST show the concrete things you verified across the repo.`;
 
-  // 10-min timeout — exploring a repo is slower than a text-only pass. Read-only tools only.
-  return parseReviewResult(await runClaude(prompt, 600_000, 3, { cwd: repoDir, repoTools: true }));
+  const lenses = config.reviewLenses ? LENSES : [""];
+  // One deep pass PER lens, in parallel (they share the read-only worktree). 10-min timeout each.
+  const results = await Promise.all(
+    lenses.map((lens) =>
+      runClaude(base + (lens ? lensBlock(lens) : "") + tail, 600_000, 3, { cwd: repoDir, repoTools: true })
+        .then(parseReviewResult)
+        .catch(() => ({ summary: "", findings: [], checked: [] }) as ReviewResult)
+    )
+  );
+  return mergeResults(results);
 }
 
 export interface VerifyResult {
