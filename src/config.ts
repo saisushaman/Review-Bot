@@ -90,6 +90,10 @@ export const config = {
   // test-rigor+docs) and merge, so the model can't consolidate to one finding (see review.ts LENSES).
   // Default ON — this is what gets the bot to baz-level coverage. REVIEW_LENSES=false = single pass.
   reviewLenses: bool("REVIEW_LENSES", true),
+  // After the lenses produce findings, run a STRICT verify pass that drops false positives and
+  // duplicates (a finding the code/docstring already handles) before posting — recall from the
+  // lenses, precision from the verify. Default ON. VERIFY_REVIEW_FINDINGS=false skips it.
+  verifyReviewFindings: bool("VERIFY_REVIEW_FINDINGS", true),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */

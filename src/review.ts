@@ -282,7 +282,9 @@ Assign severity by REAL IMPACT (don't default to Low). Every issue — including
         .catch(() => ({ summary: "", findings: [], checked: [] }) as ReviewResult)
     )
   );
-  return mergeResults(results);
+  // Verify against the diff + changed-file contents to drop false positives / duplicates.
+  const verifyCtx = `\n\nThe change under review (verify each finding against this):\n\`\`\`diff\n${clipped}\n\`\`\`${context}`;
+  return verifyFindings(mergeResults(results), { contextText: verifyCtx });
 }
 
 /** Parse claude's JSON review output into findings. Coerces `line` (models emit "138" / 138.0) and
@@ -356,6 +358,48 @@ const lensBlock = (lens: string): string =>
   `\n\nREVIEW LENS FOR THIS PASS — focus your hunt specifically on: ${lens}. Be EXHAUSTIVE within this lens and file EVERY issue you find in it as its own finding; other passes cover the other dimensions, so do NOT hold back or defer here. Findings OUTSIDE this lens are still welcome if you spot them, but this lens is your priority.`;
 
 /**
+ * PRECISION pass: the lenses maximize recall (more findings) but over-fire — they flag things the
+ * code/docstring already handles (a "misattribution" on a value the code labels neutrally, with the
+ * docstring explaining why) and duplicate each other. This strict verifier opens the cited code and
+ * DROPS any finding that is a false positive, a design choice the code documents, or a duplicate.
+ * Fails OPEN (keeps a finding unless the verdict explicitly says drop) so a parse hiccup never
+ * silently deletes real findings. When repoDir is set the verifier reads the real files to confirm.
+ */
+async function verifyFindings(
+  merged: ReviewResult,
+  ctx: { repoDir?: string; contextText?: string }
+): Promise<ReviewResult> {
+  if (!config.verifyReviewFindings || merged.findings.length <= 1) return merged;
+  const list = merged.findings
+    .map((f, i) => `${i}. [${f.severity}] ${f.path}:${f.line} — ${f.body}`)
+    .join("\n\n");
+  const prompt = `You are a STRICT verifier deciding which proposed PR-review findings are worth posting. For EACH finding, KEEP it only if it is a GENUINE, concrete, actionable defect. DROP it when ANY of these hold:
+- FALSE POSITIVE: the code already handles exactly what the finding claims — e.g. it says a value is mislabeled/misattributed but the code uses a neutral/correct label, or the docstring/comment it cites actually states the opposite, or the "unhandled" case is handled nearby.
+- DESIGN CHOICE the code documents a reason for (a docstring/comment explains why it's intentional) with no real defect.
+- DUPLICATE of another finding in this list (same underlying issue, even if worded differently) — keep only the single best one, drop the rest.
+- NOT A DEFECT: a neutral observation, a "consider" with no concrete problem, or a claim the actual code does not support.
+${ctx.repoDir ? "You are INSIDE the repo checkout — use Read/Grep/Glob to OPEN the cited file/line and CONFIRM each claim against the real code before keeping it." : "Judge against the diff/files below."}${ctx.contextText ?? ""}
+
+Findings:
+${list}
+
+Respond with ONLY a JSON object — no prose, no fences: {"verdicts": [{"i": <finding index int>, "keep": true|false, "why": "<=12 words>"}]}`;
+  try {
+    const text = await runClaude(prompt, 240_000, 3, ctx.repoDir ? { cwd: ctx.repoDir, repoTools: true } : {});
+    const parsed = extractJson<{ verdicts?: Array<{ i?: number; keep?: boolean }> }>(text);
+    const drop = new Set(
+      (parsed.verdicts ?? [])
+        .filter((v) => v.keep === false && typeof v.i === "number")
+        .map((v) => v.i)
+    );
+    if (!drop.size) return merged; // nothing to drop (or empty verdicts) → keep all (fail open)
+    return { ...merged, findings: merged.findings.filter((_, i) => !drop.has(i)) };
+  } catch {
+    return merged; // verify failed → keep all rather than lose real findings
+  }
+}
+
+/**
  * WHOLE-REPO review: run `claude -p` INSIDE the PR's checkout (repoDir) with read-only file tools,
  * so it can Read/Grep/Glob across the ENTIRE codebase to reason about the change in full context —
  * callers, types, cross-file effects, tests. The deepest review. Runs one pass PER LENS and merges.
@@ -397,7 +441,8 @@ Anchor each finding to a line on the RIGHT (added/changed) side of the diff wher
         .catch(() => ({ summary: "", findings: [], checked: [] }) as ReviewResult)
     )
   );
-  return mergeResults(results);
+  // Recall from the lenses → precision from the verify (reads the real repo to drop false positives).
+  return verifyFindings(mergeResults(results), { repoDir });
 }
 
 export interface VerifyResult {
