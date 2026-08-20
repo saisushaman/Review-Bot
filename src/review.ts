@@ -201,20 +201,16 @@ export interface PriorComment {
   body: string;
 }
 
-/** Shared review context: the PR's stated intent (for spec-matching) and the comments OTHER
- *  reviewers already left (so the bot doesn't re-state them — it focuses on what they missed). */
-function prContextBlock(pr: PrMeta, priorComments: PriorComment[]): string {
-  const body = pr.body.trim()
+/** Shared review context: the PR's stated intent (for spec-matching). We deliberately do NOT feed
+ *  other reviewers' comments and do NOT tell the bot to de-dup against them — that "report only the
+ *  net-new residual beyond everyone else" behavior is what throttled the bot to one finding on a
+ *  heavily-reviewed PR. The bot does its OWN full independent review of the current code and reports
+ *  EVERY real issue it finds; overlap with another reviewer is fine (they're independent reviews),
+ *  and because it reviews the CURRENT code, anything already fixed simply won't be a finding. */
+function prContextBlock(pr: PrMeta, _priorComments: PriorComment[]): string {
+  return pr.body.trim()
     ? `\n\nPR description — the author's STATED INTENT; judge the change against it (spec-matching), and flag anything described-but-not-done, done-but-not-described, or scope creep:\n${pr.body.slice(0, 4000)}`
     : "";
-  const prior = priorComments.length
-    ? `\n\nOther reviewers already commented on this PR (listed below). Do your OWN complete, independent review FIRST — reach your full finding list as if these did not exist — then, and only then, drop a finding ONLY when it is the SAME concrete point at the SAME location a reviewer already made (a literal duplicate). This de-dup is to avoid restating identical nits — it is NOT a budget: NEVER omit or downgrade a High or Medium because a reviewer commented in the same file or nearby, and never reduce yourself to "the residual after everyone else." Reviewers miss serious things (a security bypass they walked right past) and disagree — surfacing what they got wrong or missed is the whole point, so overlap on a real issue is expected and fine. Prior comments (for de-dup reference only):\n` +
-      priorComments
-        .slice(0, 40)
-        .map((c) => `- ${c.path}:${c.line} — ${c.body.replace(/\s+/g, " ").slice(0, 160)}`)
-        .join("\n")
-    : "";
-  return body + prior;
 }
 
 /** The other open PRs and the files they touch — context for the CROSS-PR INTERACTIONS mandate
