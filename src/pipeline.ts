@@ -80,6 +80,22 @@ function isAddressedSignal(text?: string): boolean {
   return /^(address(ed|ing)?|done|fixed|resolved|updated|ready|pushed|good to go)\b/i.test(stripped);
 }
 
+/** True when a review comment is a FOLLOW-UP / acknowledgement rather than a genuine finding —
+ *  e.g. baz's "Commit abc123 **addressed** this comment by…", "Thanks for the context…", or a bot's
+ *  automation marker. These are normally REPLIES (so thread-root filtering already excludes them),
+ *  but a reviewer occasionally posts one as a new root; it must never gate approval. */
+function isFollowUpComment(body?: string): boolean {
+  const t = (body ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return true; // nothing to address
+  return (
+    /\baddressed\b\s+this\s+comment/i.test(t) ||
+    /^commit\s+[0-9a-f]{6,}\b/i.test(t.replace(/[*_`]/g, "")) ||
+    /^(thanks|thank you|got it|acknowledged|noted|understood|makes sense|agreed)\b/i.test(t) ||
+    /CURSOR_AUTOMATION_ID/i.test(t) ||
+    /\bi'?ll save this\b/i.test(t)
+  );
+}
+
 /** True if any message already in this thread contains `marker` — used to post a note AT MOST ONCE
  *  (maybeApprove runs on every thread reply, so an un-guarded note would repeat each time). */
 async function threadHasNote(client: WebClient, threadTs: string, marker: string): Promise<boolean> {
@@ -457,16 +473,23 @@ export async function maybeApprove(
     return;
   }
 
-  // OWN-COMMENTS gate (user 2026-08-20): don't approve while OUR OWN review comments sit untouched —
-  // that's how #159 self-approved 2 min after posting 2 findings. Once the author replies to (or
-  // resolves) them, approve. Scoped to threads WE rooted, so baz's comments and its "Commit X
-  // addressed" follow-ups are irrelevant here. Holds SILENTLY — no chat note, no spam.
-  const ownUnanswered = (await gh.reviewThreads(owner, repo, number)).filter(
-    (t) => t.rootAuthor === me && !t.isResolved && !t.hasReply
+  // UNANSWERED-FINDINGS gate (user 2026-08-20): don't approve while a GENUINE review finding — ours or
+  // another reviewer's (baz/copilot/human) — sits with no reply and unresolved. That's how #159
+  // self-approved 2 min after posting 2 findings. Works on thread ROOTS, so a follow-up like baz's
+  // "Commit X addressed this comment…" is a REPLY and can never be mistaken for a finding; ack-style
+  // roots are filtered too. A thread the PR author started is not a finding. Holds SILENTLY — no notes.
+  const unanswered = (await gh.reviewThreads(owner, repo, number)).filter(
+    (t) =>
+      t.rootAuthor !== meta.authorLogin &&
+      !isFollowUpComment(t.rootBody) &&
+      !t.isResolved &&
+      !t.hasReply
   );
-  if (ownUnanswered.length) {
+  if (unanswered.length) {
     console.log(
-      `[pr-review-bot] #${number}: holding approval — ${ownUnanswered.length} of our own review comments have no reply yet`
+      `[pr-review-bot] #${number}: holding approval — ${unanswered.length} review finding(s) unanswered (${[
+        ...new Set(unanswered.map((t) => t.rootAuthor)),
+      ].join(", ")})`
     );
     return;
   }
