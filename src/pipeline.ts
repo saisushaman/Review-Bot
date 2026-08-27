@@ -491,6 +491,26 @@ export async function maybeApprove(
         ...new Set(unanswered.map((t) => t.rootAuthor)),
       ].join(", ")})`
     );
+    // Say WHY we're holding — silence left people guessing why "addressed" didn't approve. Posted at
+    // most ONCE per thread (stable marker), with clean one-line titles, so it can never become spam.
+    const MARK = "waiting on unresolved review comments";
+    if (!(await threadHasNote(client, parentTs, MARK))) {
+      const byAuthor = [...new Set(unanswered.map((t) => t.rootAuthor))].join(", ");
+      const titles = unanswered
+        .slice(0, 6)
+        .map((t) => "• " + (cleanCommentLabel(t.rootBody) ?? "(comment)"))
+        .join(`
+`);
+      const more = unanswered.length > 6 ? `
+…and ` + (unanswered.length - 6) + " more." : "";
+      await threadReply(
+        client,
+        parentTs,
+        "Holding approval — " + MARK + " from " + byAuthor + " (" + unanswered.length +
+          `). Reply to them or resolve the threads and I'll approve:
+` + titles + more
+      );
+    }
     return;
   }
 
