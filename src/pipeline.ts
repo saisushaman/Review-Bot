@@ -405,8 +405,15 @@ export async function maybeApprove(
   replyUserId: string,
   botUserId: string,
   replyTs?: string,
-  replyText?: string
+  replyText?: string,
+  // When TRUE (an explicit @-mention like "@bot addressed"), always REPLY with why we're holding
+  // instead of returning silently — a person asked, so they get an answer. The 2-min sweep passes
+  // false so periodic re-checks stay quiet (no spam).
+  explain = false
 ): Promise<void> {
+  const say = async (msg: string) => {
+    if (explain) await threadReply(client, parentTs, msg);
+  };
   if (!config.approveWhenAddressed) return;
   const pr = parsePrUrl(parentText);
   if (!pr) return;
@@ -437,10 +444,16 @@ export async function maybeApprove(
       .catch(() => undefined);
   }
 
-  if (await gh.hasApprovedBy(owner, repo, number, me)) return; // already approved
+  if (await gh.hasApprovedBy(owner, repo, number, me)) {
+    await say("Already approved this PR — nothing more to do.");
+    return;
+  }
 
   const meta = await gh.getPr(owner, repo, number);
-  if (meta.state !== "open" || meta.merged) return; // nothing to approve
+  if (meta.state !== "open" || meta.merged) {
+    await say(`That PR is ${meta.merged ? "merged" : meta.state} — nothing to approve.`);
+    return;
+  }
 
   // THOROUGHNESS GATE: never approve on a review that wasn't thorough enough — a security-sensitive
   // PR whose recorded review was only the shallow FAST pass, not the deep whole-repo one. The fix
@@ -450,9 +463,15 @@ export async function maybeApprove(
   // THE ONLY TWO GATES (user 2026-08-20): CI green, and no reviewer explicitly blocking. On the
   // "addressed" signal we approve — no comment/reply checks, no thoroughness check, no duplicate
   // guard. Both hold SILENTLY (no chat noise) and re-check on the next reply/sweep.
-  if (!(await gh.ciGreen(owner, repo, meta.headOid))) return;
+  if (!(await gh.ciGreen(owner, repo, meta.headOid))) {
+    await say("Holding approval — CI isn't green yet. I'll approve automatically once it passes.");
+    return;
+  }
   // Never approve over an EXPLICIT block: a human/bot reviewer marked CHANGES_REQUESTED.
-  if (await gh.changesRequested(owner, repo, number)) return;
+  if (await gh.changesRequested(owner, repo, number)) {
+    await say("Holding approval — a reviewer has requested changes; that review needs to be resolved or dismissed first.");
+    return;
+  }
 
   // Duplicate guard — hold for a GENUINE competing duplicate: another OPEN PR for the SAME ticket,
   // or (when neither carries a ticket) one with a STRONG changed-file overlap. Sharing one incidental
@@ -494,7 +513,8 @@ export async function maybeApprove(
     // Say WHY we're holding — silence left people guessing why "addressed" didn't approve. Posted at
     // most ONCE per thread (stable marker), with clean one-line titles, so it can never become spam.
     const MARK = "waiting on unresolved review comments";
-    if (!(await threadHasNote(client, parentTs, MARK))) {
+    // explain=true (a human asked directly) always answers, even if the note was posted before.
+    if (explain || !(await threadHasNote(client, parentTs, MARK))) {
       const byAuthor = [...new Set(unanswered.map((t) => t.rootAuthor))].join(", ");
       const titles = unanswered
         .slice(0, 6)
@@ -802,7 +822,8 @@ export async function handleMention(
     // signal (pass "addressed" as reply text); maybeApprove gates on ownership (hasReviewed/own-eyes).
     const rootTs = threadTs ?? messageTs;
     const rootText = (await messageText(client, rootTs)) || text;
-    await maybeApprove(client, rootTs, rootText, "", botUserId, messageTs, "addressed");
+    // explain=true: a human explicitly asked, so always REPLY with the outcome/reason — never silent.
+    await maybeApprove(client, rootTs, rootText, "", botUserId, messageTs, "addressed", true);
     return;
   }
 
