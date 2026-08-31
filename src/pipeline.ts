@@ -7,6 +7,7 @@ import type { CiEvent } from "./webhook.js";
 import * as reviewState from "./reviewState.js";
 import * as inflight from "./inflight.js";
 import * as mentions from "./mentions.js";
+import { status } from "./status.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Sort key: most-severe first (Blocking → High → Medium → Low), derived from the canonical list.
@@ -253,8 +254,13 @@ async function produceReview(owner: string, repo: string, number: number): Promi
           : undefined;
     if (heldConcern && !insufficient)
       console.log(`[pr-review-bot] #${number}: clean-but-hedged summary — holding approval`);
+    void status(
+      `:mag: Reviewed <https://github.com/${owner}/${repo}/pull/${number}|${owner}/${repo}#${number}> — ` +
+        `${tally} (${reviewWasDeep ? "deep" : "fast"} review). <${url}|View>`
+    );
     return { kind: "posted", url, findings: result.findings.length, heldConcern };
   } catch (err) {
+    void status(`:warning: Review FAILED on ${owner}/${repo}#${number} — ${(err as Error).message.slice(0, 150)}`);
     return { kind: "failed", error: (err as Error).message };
   }
 }
@@ -512,6 +518,11 @@ export async function maybeApprove(
     );
     // Say WHY we're holding — silence left people guessing why "addressed" didn't approve. Posted at
     // most ONCE per thread (stable marker), with clean one-line titles, so it can never become spam.
+    void status(
+      `:hourglass: Holding ${owner}/${repo}#${number} — ${unanswered.length} unresolved review comment(s) from ${[
+        ...new Set(unanswered.map((t) => t.rootAuthor)),
+      ].join(", ")}`
+    );
     const MARK = "waiting on unresolved review comments";
     // explain=true (a human asked directly) always answers, even if the note was posted before.
     if (explain || !(await threadHasNote(client, parentTs, MARK))) {
@@ -535,6 +546,9 @@ export async function maybeApprove(
   }
 
   await gh.approvePr(owner, repo, number);
+  void status(
+    `:white_check_mark: Approved <https://github.com/${owner}/${repo}/pull/${number}|${owner}/${repo}#${number}> — CI green.`
+  );
   // Post the approved reply FIRST, THEN the ✅ tick on the PR post (user-set order).
   await threadReply(client, parentTs, "✅ Approved — CI green.");
   await client.reactions

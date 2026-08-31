@@ -90,6 +90,10 @@ export const config = {
   // test-rigor+docs) and merge, so the model can't consolidate to one finding (see review.ts LENSES).
   // Default ON — this is what gets the bot to baz-level coverage. REVIEW_LENSES=false = single pass.
   reviewLenses: bool("REVIEW_LENSES", true),
+  // Optional status/updates feed — a Slack channel that mirrors what the bot is doing (startup,
+  // review started/posted, approved, held, failed). Empty = disabled. The bot must be a MEMBER of
+  // this channel (/invite @Review Window) since the token only has chat:write.
+  statusChannelId: opt("STATUS_CHANNEL_ID", ""),
   // After the lenses produce findings, run a STRICT verify pass that drops false positives and
   // duplicates (a finding the code/docstring already handles) before posting — recall from the
   // lenses, precision from the verify. Default ON. VERIFY_REVIEW_FINDINGS=false skips it.

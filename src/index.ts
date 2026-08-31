@@ -12,6 +12,7 @@ import {
 } from "./pipeline.js";
 import { startGithubWebhookServer } from "./webhook.js";
 import { mentionsBot } from "./mentions.js";
+import { initStatus, status } from "./status.js";
 
 // Socket Mode when an app-level token (xapp-…) is set: an outbound WebSocket to Slack, so there is
 // NO public Request URL / tunnel to rotate or re-verify (the quick-tunnel URL rotates on every
@@ -150,6 +151,13 @@ app.message(async ({ message, client }) => {
   const mode = config.slack.appToken ? "Socket Mode (no tunnel)" : "HTTP (Events API + tunnel)";
   console.log(
     `[pr-review-bot] listening — ${mode}  channel=${config.slack.channelId}  as=${me}  engine=headless-claude-code  ci-webhook=${webhookOn ? "on" : "off (poll only)"}`
+  );
+  // Status feed (optional STATUS_CHANNEL_ID): announce we're online with the active configuration.
+  initStatus(app.client as never);
+  void status(
+    `:large_green_circle: *Review Window is online* — watching <#${config.slack.channelId}> as ${me}. ` +
+      `Engine: headless Claude Code${config.reviewLenses ? " (multi-lens)" : ""}. ` +
+      `Approval gates: CI green, no changes-requested, no competing PR, review comments answered.`
   );
   if (!config.slack.appToken) {
     console.log(
