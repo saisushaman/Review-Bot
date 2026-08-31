@@ -418,3 +418,20 @@ export async function botReviewComments(
     .filter((c) => c.user?.login === login)
     .map((c) => ({ path: c.path, line: c.line ?? c.original_line ?? 0, body: c.body }));
 }
+
+/** ISO timestamp of OUR most recent review on the PR (any state), or null. Used to cap how long the
+ *  bot will hold approval waiting on unresolved comments — see HOLD_MAX_HOURS in pipeline.ts. */
+export async function lastOwnReviewAt(
+  owner: string,
+  repo: string,
+  number: number,
+  login: string
+): Promise<string | null> {
+  try {
+    const { data } = await octokit.pulls.listReviews({ owner, repo, pull_number: number, per_page: 100 });
+    const mine = data.filter((r) => r.user?.login === login && r.submitted_at);
+    return mine.length ? (mine[mine.length - 1].submitted_at as string) : null;
+  } catch {
+    return null;
+  }
+}

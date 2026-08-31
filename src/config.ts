@@ -94,6 +94,11 @@ export const config = {
   // review started/posted, approved, held, failed). Empty = disabled. The bot must be a MEMBER of
   // this channel (/invite @Review Window) since the token only has chat:write.
   statusChannelId: opt("STATUS_CHANNEL_ID", ""),
+  // Cap how long the bot will HOLD approval waiting for review comments to be answered. After this
+  // many hours (measured from our own review), an "addressed" signal approves anyway — the author
+  // said they handled it and we don't block indefinitely. CI-red / changes-requested are NOT capped
+  // (they are objective blockers and GitHub blocks the merge regardless). 0 = never release.
+  holdMaxHours: Number(opt("HOLD_MAX_HOURS", "6")),
   // After the lenses produce findings, run a STRICT verify pass that drops false positives and
   // duplicates (a finding the code/docstring already handles) before posting — recall from the
   // lenses, precision from the verify. Default ON. VERIFY_REVIEW_FINDINGS=false skips it.

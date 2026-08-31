@@ -511,6 +511,25 @@ export async function maybeApprove(
       !t.hasReply
   );
   if (unanswered.length) {
+    // DON'T HOLD FOREVER: after config.holdMaxHours since our own review, release the comment gate —
+    // the author signalled "addressed" and an indefinite hold helps nobody. CI-red and
+    // changes-requested are NOT released (objective blockers; GitHub blocks the merge anyway).
+    if (config.holdMaxHours > 0) {
+      const reviewedAt = await gh.lastOwnReviewAt(owner, repo, number, me);
+      const heldHours = reviewedAt ? (Date.now() - Date.parse(reviewedAt)) / 3_600_000 : 0;
+      if (reviewedAt && heldHours >= config.holdMaxHours) {
+        console.log(
+          `[pr-review-bot] #${number}: releasing hold — ${heldHours.toFixed(1)}h since review (max ${config.holdMaxHours}h), approving despite ${unanswered.length} unanswered comment(s)`
+        );
+        await say(
+          `Approving anyway — it's been ${Math.round(heldHours)}h since my review and you said it's addressed. ` +
+            `(${unanswered.length} comment(s) still show no reply on GitHub — worth a look, but I won't block on them.)`
+        );
+        unanswered.length = 0; // fall through to approve
+      }
+    }
+  }
+  if (unanswered.length) {
     console.log(
       `[pr-review-bot] #${number}: holding approval — ${unanswered.length} review finding(s) unanswered (${[
         ...new Set(unanswered.map((t) => t.rootAuthor)),
