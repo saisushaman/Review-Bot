@@ -68,7 +68,10 @@ app.message(async ({ message, client }) => {
         limit: 1,
       });
       const parentText = parent.messages?.[0]?.text ?? "";
-      await maybeApprove(client, m.thread_ts!, parentText, m.user ?? "", me, m.ts, m.text);
+      // explain=true: a person just posted an "addressed" reply, so answer them with the outcome or
+      // the reason we're holding. Only on this LIVE event — the 2-min sweep (tryApproveForMessage)
+      // passes explain=false, so a held PR never re-posts the reason.
+      await maybeApprove(client, m.thread_ts!, parentText, m.user ?? "", me, m.ts, m.text, true);
     } else {
       await handleReviewRequest(client, m.ts, m.text, me);
     }
