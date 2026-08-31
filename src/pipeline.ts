@@ -503,11 +503,17 @@ export async function maybeApprove(
   // self-approved 2 min after posting 2 findings. Works on thread ROOTS, so a follow-up like baz's
   // "Commit X addressed this comment…" is a REPLY and can never be mistaken for a finding; ack-style
   // roots are filtered too. A thread the PR author started is not a finding. Holds SILENTLY — no notes.
-  // Scoped to OUR OWN review comments only (user 2026-08-31: "don't do this" for other bots').
-  // Another reviewer's unresolved comments — baz's especially — are THEIR business, not a reason for
-  // us to block or to narrate in Slack. We only wait on findings WE raised.
+  // Hold until the review is addressed COMPLETELY — any reviewer's genuine finding (ours, baz's, a
+  // human's) that is neither resolved nor replied to. isFollowUpComment filters the "Commit X
+  // addressed this comment" / "Thanks…" roots, which is most of baz's volume, so the count reflects
+  // only real open items. The Slack note deliberately does NOT list them (user: too long) — it's one
+  // short line; the PR itself is the place to read the comments.
   const unanswered = (await gh.reviewThreads(owner, repo, number)).filter(
-    (t) => t.rootAuthor === me && !isFollowUpComment(t.rootBody) && !t.isResolved && !t.hasReply
+    (t) =>
+      t.rootAuthor !== meta.authorLogin &&
+      !isFollowUpComment(t.rootBody) &&
+      !t.isResolved &&
+      !t.hasReply
   );
   if (unanswered.length) {
     // DON'T HOLD FOREVER: after config.holdMaxHours since our own review, release the comment gate —
@@ -537,24 +543,15 @@ export async function maybeApprove(
     // Say WHY we're holding — silence left people guessing why "addressed" didn't approve. Posted at
     // most ONCE per thread (stable marker), with clean one-line titles, so it can never become spam.
     void status(
-      `:hourglass: Holding ${owner}/${repo}#${number} — ${unanswered.length} of my review comment(s) unanswered`
+      `:hourglass: Holding ${owner}/${repo}#${number} — ${unanswered.length} review comment(s) not addressed yet`
     );
-    const MARK = "waiting on replies to my review comments";
-    // explain=true (a human asked directly) always answers, even if the note was posted before.
+    const MARK = "some review comments aren't fully addressed";
     if (explain || !(await threadHasNote(client, parentTs, MARK))) {
-      const titles = unanswered
-        .slice(0, 6)
-        .map((t) => "• " + (cleanCommentLabel(t.rootBody) ?? "(comment)"))
-        .join(`
-`);
-      const more = unanswered.length > 6 ? `
-…and ` + (unanswered.length - 6) + " more." : "";
       await threadReply(
         client,
         parentTs,
         "Holding approval — " + MARK + " (" + unanswered.length +
-          `). Reply to them or resolve the threads and I'll approve:
-` + titles + more
+          " open on the PR). Reply to or resolve them and I'll approve."
       );
     }
     return;
