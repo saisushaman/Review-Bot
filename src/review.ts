@@ -345,9 +345,18 @@ function parseReviewResult(text: string): ReviewResult {
 // narrow dimension exhaustively, surfacing findings the general pass buried. This is how a top
 // reviewer gets to 5+ comments. Override the set with REVIEW_LENSES=off to fall back to one pass.
 const LENSES: string[] = [
-  "CORRECTNESS, error-handling, concurrency/state consistency, and ROBUSTNESS to malformed / edge / missing inputs (a parser or test that crashes or silently PASSES on a bad value), plus SECURITY (auth/permission bypass, injection, field forgery, unsafe input reaching a sink)",
-  "SEMANTIC ACCURACY & ATTRIBUTION — any value whose PROVENANCE is misrepresented (model-inferred, summarized, defaulted, or widened data presented to a user as their own verbatim/requested input); and CONTRACT/DOCSTRING accuracy — does the code actually match its stated docstring / Protocol / type signature (a transform the contract omits)?",
-  "TEST RIGOR — does each test verify the PRODUCTION path, or pass via a fake/mock that skips the very check it claims to prove? happy-path-only coverage, tautological assertions, a new branch with no test; and DOC / EXAMPLE / SPEC correctness — a README/handoff now contradicting the code, an example passing a raw string where an enum/type is required, an unverified guarantee, spec-vs-diff drift",
+  // L1 — CRASHES & EDGE INPUTS. On TMA #170 the old broad "correctness" lens returned ZERO while a
+  // peer reviewer caught an empty-tuple crash and an unoffered-time booking, so this lens is now a
+  // concrete checklist rather than a category name.
+  "CRASHES and EDGE-CASE INPUTS. Walk EVERY changed function and ask: what happens on an EMPTY collection (does something index [0] / .first() / unpack a possibly-empty tuple or list?), on None/null/undefined, on a zero/negative number, on a missing dict key, on an unwrapped Result/Option/error return? Trace each new or changed branch for an input that reaches it and raises, returns wrong data, or silently no-ops. Also: state that can go inconsistent, wrong async/ordering, races, and error handling that fails OPEN where it must fail closed",
+  // L2 — the class that broke callers on #170 (a newly-required parameter on a public function).
+  "BREAKING CHANGES TO EXISTING CALLERS and CONTRACT accuracy. For every signature/type/shape the diff changes, GREP the repo for its call sites and check each one still works: a parameter made REQUIRED (positional or keyword) that existing callers don't pass, a renamed/removed field, a narrowed type, a changed return shape, a new raise/error path callers don't handle. Then check CONTRACT accuracy — does each docstring / Protocol / type signature still match what the code now does (a transform, default, or raise the contract omits)?",
+  // L3 — provenance/labelling, the misattribution class.
+  "SEMANTIC ACCURACY & ATTRIBUTION — does the code present or LABEL data truthfully to the user? Data that is model-inferred, summarized, defaulted, widened, or assumed but rendered as the user's own verbatim/requested input is a MISATTRIBUTION finding. Also check user-visible copy for claims the code doesn't honour (timezone/format/audience mislabels, an example that doesn't match what will actually be used)",
+  // L4 — tests/docs/spec.
+  "TEST RIGOR and DOC/SPEC accuracy — does each test verify the PRODUCTION path, or pass via a fake/mock that skips the very thing it claims to prove? Look for happy-path-only coverage, tautological assertions, a new branch with no test, and a docstring/comment on a test that no longer matches its assertions. Then DOCS: a README/handoff/spec that now contradicts the code, an example passing a raw string where an enum/type is required, and PR-description-vs-diff drift",
+  // L5 — security (kept separate so it is never crowded out by correctness).
+  "SECURITY — auth/permission bypass (especially a check enforced in one layer but not where a client can go around it), field forgery, impersonation, privilege escalation, tenant-isolation breaks, injection/SSRF/path traversal, unvalidated or unbounded input reaching a sink, secrets/PII in logs, and unsafe upload content types",
 ];
 
 /** Merge per-lens results into one: union findings (dedupe by path:line + body-prefix so distinct
