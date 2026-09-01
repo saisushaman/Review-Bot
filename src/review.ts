@@ -370,13 +370,43 @@ function mergeResults(results: ReviewResult[]): ReviewResult {
   const findings: Finding[] = [];
   const seen = new Set<string>();
   const sig = (b: string) => b.slice(0, 70).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  for (const r of results)
-    for (const f of r.findings) {
-      const key = f.line > 0 ? `${f.path}:${f.line}:${sig(f.body)}` : `${f.path}:${sig(f.body)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      findings.push(f);
-    }
+  // SAME-ISSUE collapsing. The key above only catches duplicates at the SAME line, so two lenses
+  // describing one issue at nearby lines both survived — customer-portal #100 posted the cross-PR
+  // conflict THREE times (firestore.rules:314/315/327) and the BAA-gate ordering TWICE. Compare the
+  // distinctive words of two findings in the SAME FILE: heavy overlap means one issue, so keep the
+  // richer one. Deterministic (no extra model call), and different issues in a file share few words.
+  const words = (b: string): Set<string> =>
+    new Set(
+      b
+        .toLowerCase()
+        .replace(/[^a-z0-9\s_./-]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length > 4)
+    );
+  const sameIssue = (a: Finding, b: Finding): boolean => {
+    if (a.path !== b.path) return false;
+    const A = words(a.body);
+    const B = words(b.body);
+    if (A.size < 5 || B.size < 5) return false;
+    let shared = 0;
+    for (const w of A) if (B.has(w)) shared++;
+    return shared / Math.min(A.size, B.size) >= 0.5;
+  };
+  // Richest first (most severe, then longest) so the survivor of a collapse is the best-explained one.
+  const ordered = results
+    .flatMap((r) => r.findings)
+    .sort(
+      (a, b) =>
+        SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) ||
+        b.body.length - a.body.length
+    );
+  for (const f of ordered) {
+    const key = f.line > 0 ? `${f.path}:${f.line}:${sig(f.body)}` : `${f.path}:${sig(f.body)}`;
+    if (seen.has(key)) continue;
+    if (findings.some((kept) => sameIssue(kept, f))) continue;
+    seen.add(key);
+    findings.push(f);
+  }
   const checked = [...new Set(results.flatMap((r) => r.checked))].slice(0, 8);
   const summary =
     results.map((r) => r.summary).find((s) => s && !s.startsWith("Review produced")) ??
@@ -392,6 +422,8 @@ function mergeResults(results: ReviewResult[]): ReviewResult {
 const SYSTEM_CORE = `You are a meticulous staff engineer reviewing a pull request. You have Read/Grep/Glob over the whole repo — OPEN the changed files and their callers; never guess about code you can read.
 
 Report EVERY real issue you find as its own finding. A finding must cite CONCRETE code (path + line) and say how it actually fails or misleads — no invented or padded issues, no generic praise. If you are ~70% sure something is a problem, REPORT it (phrase it as a question); do not silently clear it.
+
+NEVER REVEAL SECRET VALUES. Review comments are posted publicly on the PR. If the change touches a secret, token, key, password or an encrypted store (.env, .env.encrypted, a sealed secret), review the FACT and the HANDLING — is a secret committed at all, is it scoped to the right environment, is it fail-closed — and refer to it by its NAME only. Never quote, echo, decode or attempt to decrypt a secret value, and never run a command to decrypt one. You do not hold the decryption key and must not seek it: when a committed value could be dangerous depending on what it decrypts to, say so and ASK THE AUTHOR to confirm, rather than asserting what it contains.
 
 SEVERITY by real impact: "Blocking" (must fix before merge — crash, data loss, security hole, broken build/caller), "High" (serious, likely to bite in production), "Medium" (real but bounded), "Low" (docs/naming/clarity, no behavioural impact).`;
 
