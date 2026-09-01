@@ -395,7 +395,7 @@ async function verifyFindings(
   const list = merged.findings
     .map((f, i) => `${i}. [${f.severity}] ${f.path}:${f.line} — ${f.body}`)
     .join("\n\n");
-  const prompt = `You are a STRICT verifier deciding which proposed PR-review findings are worth posting. For EACH finding, KEEP it only if it is a GENUINE, concrete, actionable defect. DROP it when ANY of these hold:
+  const prompt = `You are verifying proposed PR-review findings before they are posted. DEFAULT TO KEEPING: a finding is only dropped when you can POSITIVELY show it is wrong — if you are unsure, or it is a minor-but-true observation, KEEP it (a true Low finding is useful; silently deleting real findings is the worse error). DROP it ONLY when ANY of these is clearly true:
 - FALSE POSITIVE: the code already handles exactly what the finding claims — e.g. it says a value is mislabeled/misattributed but the code uses a neutral/correct label, or the docstring/comment it cites actually states the opposite, or the "unhandled" case is handled nearby.
 - DESIGN CHOICE the code documents a reason for (a docstring/comment explains why it's intentional) with no real defect.
 - DUPLICATE of another finding in this list (same underlying issue, even if worded differently) — keep only the single best one, drop the rest.
@@ -405,7 +405,8 @@ ${ctx.repoDir ? "You are INSIDE the repo checkout — use Read/Grep/Glob to OPEN
 Findings:
 ${list}
 
-Respond with ONLY a JSON object — no prose, no fences: {"verdicts": [{"i": <finding index int>, "keep": true|false, "why": "<=12 words>"}]}`;
+Respond with ONLY a JSON object — no prose, no fences: {"verdicts": [{"i": <finding index int>, "keep": true|false, "why": "<=12 words>"}]}
+Remember: keep is the DEFAULT. Only mark keep=false for a finding you can positively show is a false positive, a documented design choice, or a duplicate of another in this list.`;
   try {
     const text = await runClaude(prompt, 240_000, 3, ctx.repoDir ? { cwd: ctx.repoDir, repoTools: true } : {});
     const parsed = extractJson<{ verdicts?: Array<{ i?: number; keep?: boolean }> }>(text);
@@ -464,7 +465,13 @@ Anchor each finding to a line on the RIGHT (added/changed) side of the diff wher
     )
   );
   // Recall from the lenses → precision from the verify (reads the real repo to drop false positives).
-  return verifyFindings(mergeResults(results), { repoDir });
+  const merged = mergeResults(results);
+  console.log(
+    `[pr-review-bot] ${pr.headOid.slice(0, 7)}: lenses=[${results.map((r) => r.findings.length).join(",")}] merged=${merged.findings.length}`
+  );
+  const verified = await verifyFindings(merged, { repoDir });
+  console.log(`[pr-review-bot] ${pr.headOid.slice(0, 7)}: after verify=${verified.findings.length}`);
+  return verified;
 }
 
 export interface VerifyResult {
