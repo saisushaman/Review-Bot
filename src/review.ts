@@ -385,6 +385,16 @@ function mergeResults(results: ReviewResult[]): ReviewResult {
   return { summary, findings: findings.slice(0, 15), checked };
 }
 
+// COMPACT core for LENS passes. The full SYSTEM prompt is ~15k chars of accumulated mandates; giving
+// all of it to every lens buried the lens's own checklist and the model satisficed (TMA #170: three
+// lenses returned ZERO while a peer reviewer found 7 real issues at the same commit). A lens gets
+// this short core + its checklist, so the checklist is what dominates.
+const SYSTEM_CORE = `You are a meticulous staff engineer reviewing a pull request. You have Read/Grep/Glob over the whole repo — OPEN the changed files and their callers; never guess about code you can read.
+
+Report EVERY real issue you find as its own finding. A finding must cite CONCRETE code (path + line) and say how it actually fails or misleads — no invented or padded issues, no generic praise. If you are ~70% sure something is a problem, REPORT it (phrase it as a question); do not silently clear it.
+
+SEVERITY by real impact: "Blocking" (must fix before merge — crash, data loss, security hole, broken build/caller), "High" (serious, likely to bite in production), "Medium" (real but bounded), "Low" (docs/naming/clarity, no behavioural impact).`;
+
 const lensBlock = (lens: string): string =>
   `\n\nREVIEW LENS FOR THIS PASS — focus your hunt specifically on: ${lens}. Be EXHAUSTIVE within this lens and file EVERY issue you find in it as its own finding; other passes cover the other dimensions, so do NOT hold back or defer here. Findings OUTSIDE this lens are still welcome if you spot them, but this lens is your priority.`;
 
@@ -447,7 +457,7 @@ export async function reviewPrWithRepo(
     diff.length > config.maxDiffBytes
       ? diff.slice(0, config.maxDiffBytes) + "\n…[diff truncated]…"
       : diff;
-  const base = `${SYSTEM}
+  const base = `${config.reviewLenses ? SYSTEM_CORE : SYSTEM}
 
 You are running INSIDE a checkout of this repository at the PR's head commit (${pr.headOid}). Use the Read, Grep, and Glob tools to open ANY files you need — the changed files, their callers, the types/interfaces they use, related modules and tests — to review the change in full context. Do not guess about code you can open and read.
 
