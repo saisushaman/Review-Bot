@@ -99,10 +99,12 @@ export const config = {
   // said they handled it and we don't block indefinitely. CI-red / changes-requested are NOT capped
   // (they are objective blockers and GitHub blocks the merge regardless). 0 = never release.
   holdMaxHours: Number(opt("HOLD_MAX_HOURS", "6")),
-  // After the lenses produce findings, run a STRICT verify pass that drops false positives and
-  // duplicates (a finding the code/docstring already handles) before posting — recall from the
-  // lenses, precision from the verify. Default ON. VERIFY_REVIEW_FINDINGS=false skips it.
-  verifyReviewFindings: bool("VERIFY_REVIEW_FINDINGS", true),
+  // Optional post-lens verify pass that drops findings it judges false positives/duplicates.
+  // DEFAULT OFF (2026-09-01): measured on TMA #170 it deleted real findings (merged=2 -> 1, and
+  // earlier capped several PRs at exactly 2 comments). The user's problem is UNDER-reporting, not
+  // false positives, and mergeResults already de-duplicates — so we keep recall and let the reader
+  // judge. VERIFY_REVIEW_FINDINGS=true re-enables it.
+  verifyReviewFindings: bool("VERIFY_REVIEW_FINDINGS", false),
 };
 
 /** github.com/<owner>/<repo>/pull/<n> → parts (first match in the text). */
