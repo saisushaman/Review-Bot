@@ -390,7 +390,11 @@ function mergeResults(results: ReviewResult[]): ReviewResult {
     if (A.size < 5 || B.size < 5) return false;
     let shared = 0;
     for (const w of A) if (B.has(w)) shared++;
-    return shared / Math.min(A.size, B.size) >= 0.5;
+    // 0.35 calibrated on real output: the customer-portal #100 duplicates (the cross-PR conflict
+    // written three ways, the BAA-gate ordering written twice) both scored 0.48, while two GENUINELY
+    // different findings on the same line (connectedAtMs resetting vs an Infinity RangeError) scored
+    // 0.17. 0.5 was too strict and collapsed neither; 0.35 sits clear of both sides.
+    return shared / Math.min(A.size, B.size) >= 0.35;
   };
   // Richest first (most severe, then longest) so the survivor of a collapse is the best-explained one.
   const ordered = results
