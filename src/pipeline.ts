@@ -120,7 +120,17 @@ type ReviewOutcome =
  * handleReviewRequest and the mention `review`/`re-review` commands so the review itself is
  * identical everywhere.
  */
+/** True when a repo is on REPO_DENYLIST — the bot ignores it completely (no review, no claim, no
+ *  reply). Matches either "owner/repo" or a bare "repo" name so either form works in the env var. */
+function repoDenied(owner: string, repo: string): boolean {
+  const deny = config.github.repoDenylist;
+  if (!deny.length) return false;
+  return deny.includes(`${owner}/${repo}`.toLowerCase()) || deny.includes(repo.toLowerCase());
+}
+
 async function produceReview(owner: string, repo: string, number: number): Promise<ReviewOutcome> {
+  if (repoDenied(owner, repo))
+    return { kind: "skipped", reason: `${owner}/${repo} is on the review denylist` };
   const repoKey = `${owner}/${repo}`.toLowerCase();
   if (config.github.repoAllowlist.length && !config.github.repoAllowlist.includes(repoKey))
     return { kind: "skipped", reason: `${owner}/${repo} isn't on the review allowlist` };
@@ -348,6 +358,7 @@ export async function handleReviewRequest(
   const pr = parsePrUrl(text);
   if (!pr || !tagsRequiredUser(text)) return; // not an eligible request
   const { owner, repo, number } = pr;
+  if (repoDenied(owner, repo)) return; // denylisted repo → ignore completely (no claim, no reply)
   const key = reviewState.prKey(owner, repo, number);
 
   if (reviewState.hasReviewed(key)) return; // durable record: already reviewed

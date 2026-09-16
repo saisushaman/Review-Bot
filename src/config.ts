@@ -31,6 +31,13 @@ export const config = {
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
+    // Repos the bot must IGNORE COMPLETELY — no review, no :eyes: claim, no Slack reply. Entries may
+    // be "owner/repo" or just "repo". Unlike the allowlist (which gates only the review), a denied
+    // repo is dropped before the claim, so those PRs look untouched by this bot.
+    repoDenylist: opt("REPO_DENYLIST", "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
   },
   anthropic: {
     // Unused — the bot reviews via headless Claude Code (`claude -p`) on your Claude SUBSCRIPTION,
