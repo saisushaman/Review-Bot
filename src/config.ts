@@ -38,6 +38,13 @@ export const config = {
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
+    // Repos where a REAL PERSON must approve. The bot reviews and comments exactly as normal, but
+    // never submits a GitHub approval — instead it hands off in Slack once its gates are clear
+    // ("looks clear from my side; over to you for the final check"). "owner/repo" or bare "repo".
+    repoHumanApproval: opt("REPO_HUMAN_APPROVAL", "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
   },
   anthropic: {
     // Unused — the bot reviews via headless Claude Code (`claude -p`) on your Claude SUBSCRIPTION,

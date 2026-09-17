@@ -120,6 +120,22 @@ type ReviewOutcome =
  * handleReviewRequest and the mention `review`/`re-review` commands so the review itself is
  * identical everywhere.
  */
+/** True when a repo requires a HUMAN approval (REPO_HUMAN_APPROVAL). The bot still reviews and
+ *  comments normally; it just never submits its own GitHub approval, handing off in Slack instead. */
+function needsHumanApproval(owner: string, repo: string): boolean {
+  const list = config.github.repoHumanApproval;
+  if (!list.length) return false;
+  return list.includes(`${owner}/${repo}`.toLowerCase()) || list.includes(repo.toLowerCase());
+}
+
+/** The Slack hand-off posted in place of an approval on a human-approval repo. */
+function handoffNote(owner: string, repo: string, number: number): string {
+  return (
+    `${owner}/${repo}#${number} looks clear from my side, but this repo requires approval by a real person. ` +
+    `My review is on the PR — over to you for the final check.`
+  );
+}
+
 /** True when a repo is on REPO_DENYLIST — the bot ignores it completely (no review, no claim, no
  *  reply). Matches either "owner/repo" or a bare "repo" name so either form works in the env var. */
 function repoDenied(owner: string, repo: string): boolean {
@@ -310,6 +326,12 @@ async function finalizeReview(
   if (await gh.changesRequested(owner, repo, number)) problems.push("another reviewer requested changes");
   if (problems.length) {
     await threadReply(client, replyTs, `✅ Clean review — no issues found. Holding approval: ${problems.join("; ")}.`);
+    return;
+  }
+  if (needsHumanApproval(owner, repo)) {
+    const MARK = "requires approval by a real person";
+    if (!(await threadHasNote(client, replyTs, MARK)))
+      await threadReply(client, replyTs, `✅ Clean review — no issues found. ${handoffNote(owner, repo, number)}`);
     return;
   }
   try {
@@ -568,6 +590,15 @@ export async function maybeApprove(
     return;
   }
 
+  if (needsHumanApproval(owner, repo)) {
+    // Gates are clear, but this repo needs a person to approve — hand off ONCE instead of approving.
+    const MARK = "requires approval by a real person";
+    if (!(await threadHasNote(client, parentTs, MARK)))
+      await threadReply(client, parentTs, handoffNote(owner, repo, number));
+    void status(`:raised_hand: ${owner}/${repo}#${number} — review clear; handed off for human approval.`);
+    return;
+  }
+
   await gh.approvePr(owner, repo, number);
   void status(
     `:white_check_mark: Approved <https://github.com/${owner}/${repo}/pull/${number}|${owner}/${repo}#${number}> — CI green.`
@@ -765,6 +796,10 @@ async function approveOnRequest(
   if (await gh.changesRequested(owner, repo, number)) problems.push("a reviewer requested changes");
   if (problems.length) {
     await threadReply(client, replyThread, `can't approve ${key} yet — ${problems.join("; ")}.`);
+    return;
+  }
+  if (needsHumanApproval(owner, repo)) {
+    await threadReply(client, replyThread, handoffNote(owner, repo, number));
     return;
   }
   try {
