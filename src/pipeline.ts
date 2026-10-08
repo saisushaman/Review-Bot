@@ -8,6 +8,7 @@ import * as reviewState from "./reviewState.js";
 import * as inflight from "./inflight.js";
 import * as mentions from "./mentions.js";
 import { status } from "./status.js";
+import { correctDiffStats } from "./statCheck.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Sort key: most-severe first (Blocking → High → Medium → Low), derived from the canonical list.
@@ -235,6 +236,18 @@ async function produceReview(owner: string, repo: string, number: number): Promi
     // Split findings into those that anchor to a real diff line (posted inline) and those that
     // don't (folded into the body). A comment on a non-diff line 422s the WHOLE review, which is how
     // #31 ended up with a summary claiming findings but zero inline comments — never silently drop.
+    // GUARD: rewrite any diff statistic a finding cites ("+92/-187") to the PR's REAL numbers before
+    // anything is posted. The lenses invent these (PathwaysAI #116 claimed -206/+111 for a file that
+    // was +92/-187), and one wrong number gets the whole comment dismissed.
+    const fileStats = await gh.prFileStats(owner, repo, number);
+    if (fileStats.size) {
+      const checked = correctDiffStats(result.findings, fileStats);
+      if (checked.corrections.length)
+        console.log(
+          `[pr-review-bot] #${number}: corrected ${checked.corrections.length} diff stat(s) — ${checked.corrections.join("; ")}`
+        );
+      result = { ...result, findings: checked.findings };
+    }
     const anchor = gh.anchorableLines(diff);
     const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
     const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));

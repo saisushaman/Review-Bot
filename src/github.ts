@@ -435,3 +435,25 @@ export async function lastOwnReviewAt(
     return null;
   }
 }
+
+/** Real per-file churn for the PR (path -> {additions, deletions}) — the ground truth the
+ *  diff-statistic guard checks findings against. See statCheck.correctDiffStats. */
+export async function prFileStats(
+  owner: string,
+  repo: string,
+  number: number
+): Promise<Map<string, { additions: number; deletions: number }>> {
+  const out = new Map<string, { additions: number; deletions: number }>();
+  try {
+    const files = await octokit.paginate(octokit.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: number,
+      per_page: 100,
+    });
+    for (const f of files) out.set(f.filename, { additions: f.additions, deletions: f.deletions });
+  } catch {
+    /* best effort — an empty map simply disables the guard */
+  }
+  return out;
+}
