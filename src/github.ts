@@ -49,16 +49,51 @@ export async function getPr(owner: string, repo: string, number: number): Promis
   };
 }
 
-/** Unified diff text for the PR (bounded by the caller). */
+/** Unified diff text for the PR (bounded by the caller).
+ *
+ *  GitHub REFUSES the whole-diff media type with 406 `too_large` once a PR exceeds 20 000 diff
+ *  lines, which made getPrDiff throw and killed the ENTIRE review — PathwaysAI #125 (+175/-65 001)
+ *  just failed this way and retried forever. So on 406 we rebuild an equivalent diff from the
+ *  per-file endpoint, which has no such cap. Deleted files are collapsed to a one-line note instead
+ *  of thousands of `-` lines: on a deletion PR those lines carry almost no review signal but would
+ *  blow the model's budget and crowd out the handful of ADDED lines that actually need scrutiny. */
 export async function getPrDiff(owner: string, repo: string, number: number): Promise<string> {
-  const res = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number: number,
-    mediaType: { format: "diff" },
-  });
-  // With the diff media type Octokit returns the raw diff as `data` (string).
-  return res.data as unknown as string;
+  try {
+    const res = await octokit.pulls.get({
+      owner,
+      repo,
+      pull_number: number,
+      mediaType: { format: "diff" },
+    });
+    // With the diff media type Octokit returns the raw diff as `data` (string).
+    return res.data as unknown as string;
+  } catch (e) {
+    if ((e as { status?: number }).status !== 406) throw e;
+    const files = await octokit.paginate(octokit.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: number,
+      per_page: 100,
+    });
+    const parts: string[] = [];
+    const removed: string[] = [];
+    for (const f of files) {
+      if (f.status === "removed") {
+        removed.push(`  ${f.filename} (-${f.deletions})`);
+        continue;
+      }
+      const header = `diff --git a/${f.filename} b/${f.filename}\n--- a/${f.previous_filename ?? f.filename}\n+++ b/${f.filename}\n`;
+      // A file with no patch is binary or too large even per-file — say so rather than drop it silently.
+      parts.push(header + (f.patch ?? `@@ (no patch available — ${f.status}, +${f.additions}/-${f.deletions}) @@`));
+    }
+    if (removed.length)
+      parts.push(
+        `\n# NOTE: the full diff exceeded GitHub's 20000-line cap, so it was rebuilt per file.\n` +
+          `# ${removed.length} file(s) were DELETED outright; their contents are omitted here:\n` +
+          removed.join("\n")
+      );
+    return parts.join("\n");
+  }
 }
 
 /**
