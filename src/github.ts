@@ -492,3 +492,42 @@ export async function prFileStats(
   }
   return out;
 }
+
+/**
+ * Has a REAL PERSON approved this PR? The bot may only add its own approval AFTER a human has
+ * signed off (user 2026-11-02), so this is the gate for every approve path.
+ *
+ * Counts only the LATEST non-comment review per reviewer, so a dismissed or superseded approval
+ * stops counting. Excludes: our own login (the bot posts as that account, and its own approval must
+ * never satisfy a human gate), GitHub Apps (`...[bot]`), and any reviewer GitHub types as a Bot.
+ * Fails CLOSED — on a query error it returns false, so an outage holds approval rather than granting it.
+ */
+export async function hasHumanApproval(
+  owner: string,
+  repo: string,
+  number: number,
+  selfLogin: string
+): Promise<boolean> {
+  try {
+    const reviews = await octokit.paginate(octokit.pulls.listReviews, {
+      owner,
+      repo,
+      pull_number: number,
+      per_page: 100,
+    });
+    const latest = new Map<string, { state: string; isBot: boolean }>();
+    for (const r of reviews) {
+      const login = r.user?.login;
+      if (!login || r.state === "COMMENTED") continue; // comment-only never changes standing
+      latest.set(login, {
+        state: r.state,
+        isBot: login.endsWith("[bot]") || r.user?.type === "Bot",
+      });
+    }
+    for (const [login, v] of latest)
+      if (v.state === "APPROVED" && !v.isBot && login !== selfLogin) return true;
+    return false;
+  } catch {
+    return false; // fail closed — never approve on an unverifiable state
+  }
+}

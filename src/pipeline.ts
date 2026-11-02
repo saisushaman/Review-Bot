@@ -121,6 +121,17 @@ type ReviewOutcome =
  * handleReviewRequest and the mention `review`/`re-review` commands so the review itself is
  * identical everywhere.
  */
+/** Hand-off posted when everything is clear but no PERSON has approved yet. Mirrors how the other
+ *  review bot in this channel words it: state the verdict, be explicit that approval isn't ours to
+ *  give, point at the PR. No @-mentions — mis-tagging is worse than no tag here. */
+function awaitingHumanNote(owner: string, repo: string, number: number): string {
+  return (
+    `${owner}/${repo}#${number} has no blocking issues from my side — CI is green and my review comments are addressed. ` +
+    `I don't approve without a person signing off first, so it's over to you for the final check. ` +
+    `Once someone approves on GitHub I'll add mine automatically.`
+  );
+}
+
 /** True when a repo requires a HUMAN approval (REPO_HUMAN_APPROVAL). The bot still reviews and
  *  comments normally; it just never submits its own GitHub approval, handing off in Slack instead. */
 function needsHumanApproval(owner: string, repo: string): boolean {
@@ -341,6 +352,13 @@ async function finalizeReview(
     await threadReply(client, replyTs, `✅ Clean review — no issues found. Holding approval: ${problems.join("; ")}.`);
     return;
   }
+  if (!(await gh.hasHumanApproval(owner, repo, number, me))) {
+    const MARK = "over to you for the final check";
+    if (!(await threadHasNote(client, replyTs, MARK)))
+      await threadReply(client, replyTs, `✅ Clean review — no issues found. ${awaitingHumanNote(owner, repo, number)}`);
+    return;
+  }
+
   if (needsHumanApproval(owner, repo)) {
     const MARK = "requires approval by a real person";
     if (!(await threadHasNote(client, replyTs, MARK)))
@@ -603,6 +621,16 @@ export async function maybeApprove(
     return;
   }
 
+  // HUMAN-APPROVAL GATE (user 2026-11-02): never approve until a real person has approved. Our own
+  // login doesn't count, nor do other bots. Holds and hands off once; approves on a later sweep.
+  if (!(await gh.hasHumanApproval(owner, repo, number, me))) {
+    const MARK = "over to you for the final check";
+    if (!(await threadHasNote(client, parentTs, MARK)))
+      await threadReply(client, parentTs, awaitingHumanNote(owner, repo, number));
+    void status(`:raised_hand: ${owner}/${repo}#${number} — clear, waiting on a human approval.`);
+    return;
+  }
+
   if (needsHumanApproval(owner, repo)) {
     // Gates are clear, but this repo needs a person to approve — hand off ONCE instead of approving.
     const MARK = "requires approval by a real person";
@@ -811,6 +839,11 @@ async function approveOnRequest(
     await threadReply(client, replyThread, `can't approve ${key} yet — ${problems.join("; ")}.`);
     return;
   }
+  if (!(await gh.hasHumanApproval(owner, repo, number, await gh.authUserLogin()))) {
+    await threadReply(client, replyThread, awaitingHumanNote(owner, repo, number));
+    return;
+  }
+
   if (needsHumanApproval(owner, repo)) {
     await threadReply(client, replyThread, handoffNote(owner, repo, number));
     return;
