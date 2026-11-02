@@ -429,10 +429,20 @@ Report EVERY real issue you find as its own finding. A finding must cite CONCRET
 
 NEVER REVEAL SECRET VALUES. Review comments are posted publicly on the PR. If the change touches a secret, token, key, password or an encrypted store (.env, .env.encrypted, a sealed secret), review the FACT and the HANDLING — is a secret committed at all, is it scoped to the right environment, is it fail-closed — and refer to it by its NAME only. Never quote, echo, decode or attempt to decrypt a secret value, and never run a command to decrypt one. You do not hold the decryption key and must not seek it: when a committed value could be dangerous depending on what it decrypts to, say so and ASK THE AUTHOR to confirm, rather than asserting what it contains.
 
-SEVERITY by real impact: "Blocking" (must fix before merge — crash, data loss, security hole, broken build/caller), "High" (serious, likely to bite in production), "Medium" (real but bounded), "Low" (docs/naming/clarity, no behavioural impact).`;
+SCOPE — REVIEW THIS PR, NOT THE REPO. Your subject is what THIS diff changes and what it breaks. Report:
+- bugs this PR INTRODUCES (code it added or changed behaves wrongly, or a caller it changed now breaks),
+- anything that must be ADDRESSED IN THIS PR before it can merge,
+- and genuinely useful optional improvements to the changed code, clearly flagged as optional.
+Do NOT report pre-existing problems the PR merely sits next to, refactors you would like elsewhere in the repo, or work that plainly belongs to a different ticket. The one exception: a pre-existing issue this PR makes materially WORSE or newly reachable IS in scope — say explicitly that it predates the change and what the PR does to it. Open the surrounding code freely to UNDERSTAND the change; only the change itself is what you file findings about.
+
+SEVERITY by real impact, and whether it must be fixed HERE:
+- "Blocking" — must fix before this PR merges: crash, data loss, security hole, broken build, a caller this PR breaks.
+- "High" — serious and introduced by this PR; fix in this PR.
+- "Medium" — a real, bounded problem in the changed code; fix here unless the author gives a reason.
+- "Low" — NICE TO HAVE. Optional polish on the changed code (naming, docs, clarity, a tidier approach) with no behavioural impact. Begin a Low finding with "Nice to have —" and make it plain the PR can merge without it. Never dress up a nice-to-have as a defect, and never pad the list to look thorough: if the only honest answer for a lens is zero findings, return zero.`;
 
 const lensBlock = (lens: string): string =>
-  `\n\nREVIEW LENS FOR THIS PASS — focus your hunt specifically on: ${lens}. Be EXHAUSTIVE within this lens and file EVERY issue you find in it as its own finding; other passes cover the other dimensions, so do NOT hold back or defer here. Findings OUTSIDE this lens are still welcome if you spot them, but this lens is your priority.`;
+  `\n\nREVIEW LENS FOR THIS PASS — focus your hunt specifically on: ${lens}. Be EXHAUSTIVE within this lens and file EVERY issue you find in it as its own finding; other passes cover the other dimensions, so do NOT hold back or defer here. Findings OUTSIDE this lens are still welcome if you spot them, but this lens is your priority. Exhaustive means exhaustive about THIS CHANGE, not about the repo — the scope rule above still binds, and zero findings is the correct answer when this lens is clean on this diff.`;
 
 /**
  * PRECISION pass: the lenses maximize recall (more findings) but over-fire — they flag things the

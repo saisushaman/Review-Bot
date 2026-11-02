@@ -352,17 +352,19 @@ async function finalizeReview(
     await threadReply(client, replyTs, `✅ Clean review — no issues found. Holding approval: ${problems.join("; ")}.`);
     return;
   }
-  if (!(await gh.hasHumanApproval(owner, repo, number, me))) {
-    const MARK = "over to you for the final check";
-    if (!(await threadHasNote(client, replyTs, MARK)))
-      await threadReply(client, replyTs, `✅ Clean review — no issues found. ${awaitingHumanNote(owner, repo, number)}`);
-    return;
-  }
-
+  // ORDER MATTERS: a REPO_HUMAN_APPROVAL repo is never approved by this bot at all, so it must be
+  // answered BEFORE the "waiting on a human" gate — otherwise it would promise to approve later.
   if (needsHumanApproval(owner, repo)) {
     const MARK = "requires approval by a real person";
     if (!(await threadHasNote(client, replyTs, MARK)))
       await threadReply(client, replyTs, `✅ Clean review — no issues found. ${handoffNote(owner, repo, number)}`);
+    return;
+  }
+
+  if (!(await gh.hasHumanApproval(owner, repo, number, me))) {
+    const MARK = "over to you for the final check";
+    if (!(await threadHasNote(client, replyTs, MARK)))
+      await threadReply(client, replyTs, `✅ Clean review — no issues found. ${awaitingHumanNote(owner, repo, number)}`);
     return;
   }
   try {
@@ -623,20 +625,22 @@ export async function maybeApprove(
 
   // HUMAN-APPROVAL GATE (user 2026-11-02): never approve until a real person has approved. Our own
   // login doesn't count, nor do other bots. Holds and hands off once; approves on a later sweep.
-  if (!(await gh.hasHumanApproval(owner, repo, number, me))) {
-    const MARK = "over to you for the final check";
-    if (!(await threadHasNote(client, parentTs, MARK)))
-      await threadReply(client, parentTs, awaitingHumanNote(owner, repo, number));
-    void status(`:raised_hand: ${owner}/${repo}#${number} — clear, waiting on a human approval.`);
-    return;
-  }
-
+  // ORDER MATTERS: a REPO_HUMAN_APPROVAL repo is never approved by this bot at all, so it must be
+  // answered BEFORE the "waiting on a human" gate — otherwise it would promise to approve later.
   if (needsHumanApproval(owner, repo)) {
     // Gates are clear, but this repo needs a person to approve — hand off ONCE instead of approving.
     const MARK = "requires approval by a real person";
     if (!(await threadHasNote(client, parentTs, MARK)))
       await threadReply(client, parentTs, handoffNote(owner, repo, number));
     void status(`:raised_hand: ${owner}/${repo}#${number} — review clear; handed off for human approval.`);
+    return;
+  }
+
+  if (!(await gh.hasHumanApproval(owner, repo, number, me))) {
+    const MARK = "over to you for the final check";
+    if (!(await threadHasNote(client, parentTs, MARK)))
+      await threadReply(client, parentTs, awaitingHumanNote(owner, repo, number));
+    void status(`:raised_hand: ${owner}/${repo}#${number} — clear, waiting on a human approval.`);
     return;
   }
 
@@ -839,13 +843,15 @@ async function approveOnRequest(
     await threadReply(client, replyThread, `can't approve ${key} yet — ${problems.join("; ")}.`);
     return;
   }
-  if (!(await gh.hasHumanApproval(owner, repo, number, await gh.authUserLogin()))) {
-    await threadReply(client, replyThread, awaitingHumanNote(owner, repo, number));
+  // ORDER MATTERS: a REPO_HUMAN_APPROVAL repo is never approved by this bot at all, so it must be
+  // answered BEFORE the "waiting on a human" gate — otherwise it would promise to approve later.
+  if (needsHumanApproval(owner, repo)) {
+    await threadReply(client, replyThread, handoffNote(owner, repo, number));
     return;
   }
 
-  if (needsHumanApproval(owner, repo)) {
-    await threadReply(client, replyThread, handoffNote(owner, repo, number));
+  if (!(await gh.hasHumanApproval(owner, repo, number, await gh.authUserLogin()))) {
+    await threadReply(client, replyThread, awaitingHumanNote(owner, repo, number));
     return;
   }
   try {
