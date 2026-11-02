@@ -76,10 +76,11 @@ MISSING-CODE & UNCHANGED-FILE FINDINGS — the most important bugs often are NOT
 
 EXHAUSTIVE-CLAIM CHECK — when a PR claims to handle a COMPLETE set ("delete every companyId-scoped record", "sweep all X", "cascade the whole thing", "cover all cases", "migrate every caller"), do NOT spot-check a sample: build the FULL set from the AUTHORITATIVE source (every collection in firestore.rules, every enum variant, every route/caller, every field) and reconcile it item-by-item — each is either HANDLED, a deliberate SURVIVOR (documented, with a reason), a GAP, or NOT-ACTUALLY-IN-SCOPE (e.g. keyed differently, or vestigial with no live writer). Report EVERY gap. And when the finding IS this completeness gap, put the WHOLE reconciliation in the body — the complete list of what's unaccounted for, not "several, e.g. A and B": a partial list of a completeness defect is itself incomplete, and it lets the reader fix the two you named and re-ship with the rest still orphaned. Excluding an item is a claim too — say why (vestigial/not-scoped), don't just omit it.
 
-CROSS-PR INTERACTIONS — when OTHER OPEN PRs are listed below (with the files each touches), this change does not land alone. Reason about how it composes with them, because a single-PR-in-isolation review is blind to exactly the bugs that only appear at integration: (a) MERGE / PATH COLLISION — another open PR creates or rewrites the SAME file with different content (a shared CI workflow, config, .gitignore, a barrel/index), so a naive merge silently clobbers one side's work; name both PRs and the file. (b) SEQUENCING / CUTOVER HAZARD — this PR deletes, renames, or moves something (an env var, a config key, a file, an export) that another open PR — or a documented cutover/migration step in THIS PR's own docs (HANDOFF.md, a migration guide) — still depends on; a cutover that removes a variable whose contents another change relies on drops that behavior in production even though each PR looks fine alone. (c) DUPLICATED / CONFLICTING INFRA — two PRs add overlapping tooling (two CI files doing similar jobs, two configs for one system) that must be combined or deconflicted, not both merged. Flag these as real findings (severity by impact — a lost router or clobbered test job is High/Medium), and say which PR to coordinate with. Do NOT adjudicate the other PR's internals — you only have its file list; name the interaction and whose branch to check.
+CROSS-PR INTERACTIONS — when OTHER OPEN PRs are listed below (with the files each touches), this change does not land alone. Reason about how it composes with them, because a single-PR-in-isolation review is blind to exactly the bugs that only appear at integration: (a) MERGE / PATH COLLISION — another open PR creates or rewrites the SAME file with different content (a shared CI workflow, config, .gitignore, a barrel/index), so a naive merge silently clobbers one side's work; name both PRs and the file. (b) SEQUENCING / CUTOVER HAZARD — this PR deletes, renames, or moves something (an env var, a config key, a file, an export) that another open PR — or a documented cutover/migration step in THIS PR's own docs (HANDOFF.md, a migration guide) — still depends on; a cutover that removes a variable whose contents another change relies on drops that behavior in production even though each PR looks fine alone. (c) DUPLICATED / CONFLICTING INFRA — two PRs add overlapping tooling (two CI files doing similar jobs, two configs for one system) that must be combined or deconflicted, not both merged. Flag these as real findings (severity by impact — a lost router or clobbered test job is High/Medium), and say which PR to coordinate with. Do NOT adjudicate the other PR's internals — you only have its file list; name the interaction and whose branch to check. Two files merely being edited by two PRs is NOT a finding: file a collision only when the edits plausibly overlap (the same function, section/heading, config key or line range) or one PR removes something the other uses. If your own text would say "a clean merge is likely" or "likely different sections", do not file it. At most ONE finding per (other PR, file) pair — never restate the same interaction twice.
 
 RELIABILITY:
 - Substantiate every finding with the specific code and how it fails. If uncertain, phrase the body as a question but still include it.
+- THIRD-PARTY BEHAVIOUR CLAIMS: when a finding depends on how an EXTERNAL system behaves (a cloud provider's IAM or API, GitHub, a database engine, a library's runtime semantics), say where that behaviour is documented — a repo doc or code comment you read, or the vendor doc the PR links. If you cannot point to a source, phrase the finding as a QUESTION ("does X accept…?") and rate it no higher than Medium; never assert unconfirmed vendor behaviour as fact. A confident claim about a provider that turns out wrong (e.g. "this IAM condition matches the OCID, not the name" when the vendor's own example uses the name) is the costliest kind of false positive.
 - Prefer anchoring each finding to a real line on the RIGHT (added/changed) side of the diff at the head revision — BUT a missing-enforcement / unchanged-file finding (see above) is still required even when the best anchor is only the nearest related changed line.
 
 OUTPUT CONTRACT — non-negotiable:
@@ -362,7 +363,7 @@ const LENSES: string[] = [
 /** Merge per-lens results into one: union findings (dedupe by path:line + body-prefix so distinct
  *  points at the same line survive but true duplicates across lenses collapse), union "checked",
  *  first real summary. Cap findings so a runaway lens can't flood the PR. */
-function mergeResults(results: ReviewResult[]): ReviewResult {
+export function mergeResults(results: ReviewResult[]): ReviewResult {
   // Merge only TRUE duplicates across lenses (same path:line AND near-identical opening) — that keeps
   // two DIFFERENT concerns at the same line (a code-semantic point vs a docs-drift point) as separate
   // comments, which is the baz-level coverage we want, while collapsing a finding two lenses phrased
@@ -383,13 +384,26 @@ function mergeResults(results: ReviewResult[]): ReviewResult {
         .split(/\s+/)
         .filter((w) => w.length > 4)
     );
+  // PR references (#123) a finding names. Two findings in the same file that name the SAME other PRs
+  // are the same cross-PR interaction written twice — PathwaysAI #181 posted "coordinate the README
+  // merge with #173/#178/#144" twice on one line, worded differently enough to slip past the overlap
+  // check (shared-word ratio below the threshold).
+  const prRefs = (b: string): string =>
+    [...new Set(b.match(/#\d+/g) ?? [])].sort().join(",");
   const sameIssue = (a: Finding, b: Finding): boolean => {
     if (a.path !== b.path) return false;
+    const refsA = prRefs(a.body);
+    if (refsA && refsA === prRefs(b.body)) return true;
     const A = words(a.body);
     const B = words(b.body);
     if (A.size < 5 || B.size < 5) return false;
     let shared = 0;
     for (const w of A) if (B.has(w)) shared++;
+    // Findings within a few lines of each other are far more likely to be one issue, so they use a
+    // looser bar (0.25). Calibrated against the same data as below: genuinely different findings on
+    // the SAME line scored 0.17, so 0.25 still keeps them apart.
+    const near = a.line > 0 && b.line > 0 && Math.abs(a.line - b.line) <= 3;
+    if (near && shared / Math.min(A.size, B.size) >= 0.25) return true;
     // 0.35 calibrated on real output: the customer-portal #100 duplicates (the cross-PR conflict
     // written three ways, the BAA-gate ordering written twice) both scored 0.48, while two GENUINELY
     // different findings on the same line (connectedAtMs resetting vs an Infinity RangeError) scored
@@ -411,7 +425,21 @@ function mergeResults(results: ReviewResult[]): ReviewResult {
     seen.add(key);
     findings.push(f);
   }
-  const checked = [...new Set(results.flatMap((r) => r.checked))].slice(0, 8);
+  // "checked" items from different lenses often restate one point (PathwaysAI #181 listed the same
+  // validation chain twice). Drop an item whose distinctive words mostly repeat an earlier one.
+  const checked: string[] = [];
+  for (const c of results.flatMap((r) => r.checked)) {
+    const C = words(c);
+    const dup = checked.some((k) => {
+      const K = words(k);
+      if (C.size < 4 || K.size < 4) return k === c;
+      let shared = 0;
+      for (const w of C) if (K.has(w)) shared++;
+      return shared / Math.min(C.size, K.size) >= 0.5;
+    });
+    if (!dup) checked.push(c);
+    if (checked.length >= 8) break;
+  }
   const summary =
     results.map((r) => r.summary).find((s) => s && !s.startsWith("Review produced")) ??
     results[0]?.summary ??
@@ -434,6 +462,10 @@ SCOPE — REVIEW THIS PR, NOT THE REPO. Your subject is what THIS diff changes a
 - anything that must be ADDRESSED IN THIS PR before it can merge,
 - and genuinely useful optional improvements to the changed code, clearly flagged as optional.
 Do NOT report pre-existing problems the PR merely sits next to, refactors you would like elsewhere in the repo, or work that plainly belongs to a different ticket. The one exception: a pre-existing issue this PR makes materially WORSE or newly reachable IS in scope — say explicitly that it predates the change and what the PR does to it. Open the surrounding code freely to UNDERSTAND the change; only the change itself is what you file findings about.
+
+THIRD-PARTY BEHAVIOUR: if a finding rests on how an external service or library behaves (cloud IAM/APIs, GitHub, a DB engine), cite where that is documented (repo doc, code comment, or the vendor doc the PR links). With no source, phrase it as a question and rate it at most Medium.
+
+CROSS-PR: two PRs editing the same file is not a finding by itself — only file it when the edits plausibly overlap or one PR removes something the other relies on, and at most once per (other PR, file).
 
 SEVERITY by real impact, and whether it must be fixed HERE:
 - "Blocking" — must fix before this PR merges: crash, data loss, security hole, broken build, a caller this PR breaks.
