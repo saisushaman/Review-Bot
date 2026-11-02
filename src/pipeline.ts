@@ -9,6 +9,7 @@ import * as inflight from "./inflight.js";
 import * as mentions from "./mentions.js";
 import { status } from "./status.js";
 import { correctDiffStats } from "./statCheck.js";
+import { dropFindingsOtherBotsMade } from "./dedupeExternal.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Sort key: most-severe first (Blocking → High → Medium → Low), derived from the canonical list.
@@ -259,6 +260,18 @@ async function produceReview(owner: string, repo: string, number: number): Promi
         );
       result = { ...result, findings: checked.findings };
     }
+    // DON'T REPEAT ANOTHER BOT. Re-read the PR's comments NOW rather than reusing the ones fetched
+    // before the review — a deep review takes minutes, and another reviewer may well have posted in
+    // the meantime. Only another BOT's top-level comments suppress ours; replies and humans don't.
+    const postedNow = await gh.allReviewComments(owner, repo, number).catch(() => priorComments);
+    const deduped = dropFindingsOtherBotsMade(result.findings, postedNow, me);
+    if (deduped.dropped.length) {
+      console.log(
+        `[pr-review-bot] #${number}: dropped ${deduped.dropped.length} finding(s) another bot already raised — ${deduped.dropped.join("; ")}`
+      );
+      result = { ...result, findings: deduped.findings };
+    }
+
     const anchor = gh.anchorableLines(diff);
     const ordered = [...result.findings].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity]);
     const inline = ordered.filter((f) => anchor.get(f.path)?.has(f.line));

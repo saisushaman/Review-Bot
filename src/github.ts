@@ -422,23 +422,42 @@ export async function otherOpenPrs(
 /** ALL inline review comments on the PR (every reviewer: the bot's own automated review + codex/
  *  copilot/gemini/charlie + humans) — the findings the verify step confirms are addressed in the
  *  commits before approving. */
+export interface ExistingComment {
+  path: string;
+  line: number;
+  body: string;
+  author: string;
+  /** A GitHub App / bot account. NOTE: this is NOT a login-suffix test — Copilot posts as the login
+   *  "Copilot" with no "[bot]" suffix, so the account TYPE is the reliable signal and the suffix is
+   *  only a fallback for apps GitHub types as a User. */
+  isBot: boolean;
+  /** A threaded reply, not a top-level finding. Replies are conversation ("addressed in abc123",
+   *  "agreed, fixing") and must never be treated as another reviewer's finding. */
+  isReply: boolean;
+}
+
 export async function allReviewComments(
   owner: string,
   repo: string,
   number: number
-): Promise<Array<{ path: string; line: number; body: string; author: string }>> {
+): Promise<ExistingComment[]> {
   const { data } = await octokit.pulls.listReviewComments({
     owner,
     repo,
     pull_number: number,
     per_page: 100,
   });
-  return data.map((c) => ({
-    path: c.path,
-    line: c.line ?? c.original_line ?? 0,
-    body: c.body,
-    author: c.user?.login ?? "",
-  }));
+  return data.map((c) => {
+    const author = c.user?.login ?? "";
+    return {
+      path: c.path,
+      line: c.line ?? c.original_line ?? 0,
+      body: c.body,
+      author,
+      isBot: c.user?.type === "Bot" || author.endsWith("[bot]"),
+      isReply: c.in_reply_to_id != null,
+    };
+  });
 }
 
 /** The bot's own inline review comments — used to reconstruct prior findings for the verify step. */
